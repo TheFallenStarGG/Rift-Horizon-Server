@@ -3,8 +3,6 @@
  * Client: wss://<worker>/ws?room=CODE&name=Player
  */
 
-export { GameRoom };
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -295,4 +293,4 @@ export class GameRoom {
 
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
-                }
+      }
