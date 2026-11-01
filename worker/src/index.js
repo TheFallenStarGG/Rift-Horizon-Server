@@ -11,7 +11,7 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
     if (url.pathname === '/' || url.pathname === '/health') return json({ ok: true, service: 'fps-game-server' });
 
-    // Proxy recording upload to Catbox / Litterbox (no R2)
+    // Proxy recording upload to Catbox / Litterbox (no R2). Catbox first; Litterbox on failure.
     if (url.pathname === '/api/rec' && request.method === 'PUT') {
       try {
         let name = (url.searchParams.get('name') || '').replace(/[^a-zA-Z0-9._-]/g, '');
@@ -21,29 +21,49 @@ export default {
         if (!buf.byteLength) return json({ error: 'empty body' }, 400);
         if (buf.byteLength > 1024 * 1024 * 1024) return json({ error: 'file too large (max 1GB)' }, 413);
         const prefer = url.searchParams.get('host');
-        const useLitter = prefer === 'litterbox' || buf.byteLength > 200 * 1024 * 1024;
         const type = request.headers.get('Content-Type') || (name.endsWith('.webm') ? 'video/webm' : 'video/mp4');
-        const form = new FormData();
-        form.append('reqtype', 'fileupload');
-        form.append('fileToUpload', new Blob([buf], { type }), name);
-        let endpoint;
-        if (useLitter) {
-          form.append('time', '72h');
-          endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
-        } else {
-          endpoint = 'https://catbox.moe/user/api.php';
+        const forceLitter = prefer === 'litterbox' || buf.byteLength > 200 * 1024 * 1024;
+
+        async function postTo(useLitter) {
+          const form = new FormData();
+          form.append('reqtype', 'fileupload');
+          form.append('fileToUpload', new Blob([buf], { type }), name);
+          let endpoint;
+          if (useLitter) {
+            form.append('time', '72h');
+            endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
+          } else {
+            endpoint = 'https://catbox.moe/user/api.php';
+          }
+          const up = await fetch(endpoint, { method: 'POST', body: form });
+          const text = (await up.text()).trim();
+          if (!up.ok || !/^https?:\/\//i.test(text)) {
+            throw new Error(text.slice(0, 200) || 'upload rejected');
+          }
+          return {
+            ok: true,
+            url: text,
+            host: useLitter ? 'litterbox' : 'catbox',
+            expires: useLitter ? '72 hours' : '',
+          };
         }
-        const up = await fetch(endpoint, { method: 'POST', body: form });
-        const text = (await up.text()).trim();
-        if (!up.ok || !/^https?:\/\//i.test(text)) {
-          return json({ error: text.slice(0, 200) || 'upload rejected' }, 502);
+
+        if (!forceLitter) {
+          try {
+            return json(await postTo(false));
+          } catch (e) {
+            try {
+              return json(await postTo(true));
+            } catch (e2) {
+              return json({ error: String(e2.message || e2) }, 502);
+            }
+          }
         }
-        return json({
-          ok: true,
-          url: text,
-          host: useLitter ? 'litterbox' : 'catbox',
-          expires: useLitter ? '72 hours' : '',
-        });
+        try {
+          return json(await postTo(true));
+        } catch (e) {
+          return json({ error: String(e.message || e) }, 502);
+        }
       } catch (e) {
         return json({ error: String(e.message || e) }, 500);
       }
