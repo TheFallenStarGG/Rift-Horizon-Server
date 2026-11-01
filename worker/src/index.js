@@ -10,6 +10,45 @@ export default {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
     if (url.pathname === '/' || url.pathname === '/health') return json({ ok: true, service: 'fps-game-server' });
+
+    // Proxy recording upload to Catbox / Litterbox (no R2)
+    if (url.pathname === '/api/rec' && request.method === 'PUT') {
+      try {
+        let name = (url.searchParams.get('name') || '').replace(/[^a-zA-Z0-9._-]/g, '');
+        if (!name || name.length > 80) name = `rec-${Date.now()}.mp4`;
+        if (!/\.(mp4|webm)$/i.test(name)) name += '.mp4';
+        const buf = await request.arrayBuffer();
+        if (!buf.byteLength) return json({ error: 'empty body' }, 400);
+        if (buf.byteLength > 1024 * 1024 * 1024) return json({ error: 'file too large (max 1GB)' }, 413);
+        const prefer = url.searchParams.get('host');
+        const useLitter = prefer === 'litterbox' || buf.byteLength > 200 * 1024 * 1024;
+        const type = request.headers.get('Content-Type') || (name.endsWith('.webm') ? 'video/webm' : 'video/mp4');
+        const form = new FormData();
+        form.append('reqtype', 'fileupload');
+        form.append('fileToUpload', new Blob([buf], { type }), name);
+        let endpoint;
+        if (useLitter) {
+          form.append('time', '72h');
+          endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
+        } else {
+          endpoint = 'https://catbox.moe/user/api.php';
+        }
+        const up = await fetch(endpoint, { method: 'POST', body: form });
+        const text = (await up.text()).trim();
+        if (!up.ok || !/^https?:\/\//i.test(text)) {
+          return json({ error: text.slice(0, 200) || 'upload rejected' }, 502);
+        }
+        return json({
+          ok: true,
+          url: text,
+          host: useLitter ? 'litterbox' : 'catbox',
+          expires: useLitter ? '72 hours' : '',
+        });
+      } catch (e) {
+        return json({ error: String(e.message || e) }, 500);
+      }
+    }
+
     if (url.pathname === '/ws') {
       const room = (url.searchParams.get('room') || 'lobby').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24) || 'lobby';
       return env.ROOM.get(env.ROOM.idFromName(room)).fetch(request);
@@ -20,7 +59,11 @@ export default {
 };
 
 function cors() {
-  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
 }
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...cors() } });
