@@ -1,54 +1,30 @@
 /**
- * FPS multiplayer + chat — Cloudflare Worker + Durable Object rooms
- * Client: wss://<worker>/ws?room=CODE&name=Player
+ * Realm Range multiplayer — Cloudflare Worker + Durable Object rooms (class GameRoom, binding ROOM: unchanged).
+ * Client: wss://<worker>/ws?room=CODE&name=Player&mode=ffa|duel|team|custom&lo=main.side.melee
+ * The server owns health, damage, kills, rounds, respawns and builds.
+ * KEEP the GUNS / MELEE tables in sync with lib/arsenal.js in the client repo.
  */
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: cors() });
-    }
-
-    if (url.pathname === '/' || url.pathname === '/health') {
-      return json({ ok: true, service: 'fps-game-server' });
-    }
-
+    if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
+    if (url.pathname === '/' || url.pathname === '/health') return json({ ok: true, service: 'fps-game-server' });
     if (url.pathname === '/ws') {
-      const room =
-        (url.searchParams.get('room') || 'lobby')
-          .toLowerCase()
-          .replace(/[^a-z0-9_-]/g, '')
-          .slice(0, 24) || 'lobby';
-      const id = env.ROOM.idFromName(room);
-      const stub = env.ROOM.get(id);
-      return stub.fetch(request);
+      const room = (url.searchParams.get('room') || 'lobby').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24) || 'lobby';
+      return env.ROOM.get(env.ROOM.idFromName(room)).fetch(request);
     }
-
-    if (url.pathname === '/api/create') {
-      return json({ room: randomRoom() }, 200);
-    }
-
+    if (url.pathname === '/api/create') return json({ room: randomRoom() });
     return json({ error: 'not_found' }, 404);
   },
 };
 
 function cors() {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  };
+  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 }
-
 function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...cors() },
-  });
+  return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...cors() } });
 }
-
 function randomRoom() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let s = '';
@@ -56,215 +32,458 @@ function randomRoom() {
   return s;
 }
 
+// ---------- tables ----------
+const G = (cd, head, body, limb, extra = {}) => ({ cd, head, body, limb, pellets: 1, fall: null, ...extra });
+const GUNS = {
+  vanguard: G(0.1, 40, 20, 14),
+  stinger: G(0.067, 26, 13, 10, { fall: [12, 28, 0.5] }),
+  breacher: G(0.9, 24, 12, 8, { pellets: 8, fall: [6, 20, 0.15] }),
+  longbow: G(1.2, 200, 34, 34),
+  ridgeback: G(0.6, 300, 300, 300),
+  p9: G(0.14, 34, 17, 12, { fall: [20, 50, 0.55] }),
+  marshal: G(0.5, 75, 38, 28, { fall: [20, 45, 0.6] }),
+  spitfire: G(0.06, 18, 9, 7, { fall: [8, 20, 0.4] }),
+  cutter: G(0.3, 20, 10, 7, { pellets: 10, fall: [4, 14, 0.1] }),
+  whisper: G(0.9, 130, 75, 55),
+};
+const MELEE = {
+  fists: { front: 18, head: 28, range: 1.7, cd: 0.34 },
+  knife: { front: 30, head: 45, back: 200, range: 1.9, cd: 0.42 },
+  machete: { front: 45, head: 65, range: 2.2, cd: 0.7, heal: 35 },
+  tomahawk: { front: 40, head: 60, thrown: 120, range: 2.0, cd: 0.5, throwRange: 45, throwCd: 3.5 },
+  sledge: { front: 80, head: 100, range: 2.5, cd: 1.1, demolish: true },
+};
+const SLOT_OF = {
+  vanguard: 'main', stinger: 'main', breacher: 'main', longbow: 'main', ridgeback: 'main',
+  p9: 'side', marshal: 'side', spitfire: 'side', cutter: 'side', whisper: 'side',
+  fists: 'melee', knife: 'melee', machete: 'melee', tomahawk: 'melee', sledge: 'melee',
+};
+const SLOTS = ['main', 'side', 'melee'];
+const DEFAULT_LO = ['vanguard', 'p9', 'knife'];
+
+const MODES = {
+  ffa: { cap: 8, min: 1, teams: false, rounds: false, target: 20, respawn: 3000 },
+  custom: { cap: 12, min: 1, teams: false, rounds: false, target: 30, respawn: 3000 },
+  duel: { cap: 2, min: 2, teams: true, rounds: true, win: 3, respawn: 0 },
+  team: { cap: 4, min: 4, teams: true, rounds: true, win: 3, respawn: 0 },
+};
+
+// spawn points (mirror lib/scene.js SPAWNS; the Pit arena is at x 220, z 170)
+const FFA = [[-14, 14], [14, 14], [0, -12], [-120, -60], [-190, -60], [60, -60], [200, -60], [0, -120], [0, 100],
+  [110, -20], [-60, 60], [-100, 120], [60, 120], [250, -60], [0, -262]].map(([x, z]) => ({ x, y: 0, z, yaw: 0 }));
+const PIT = (pts, yaw) => pts.map(([x, z]) => ({ x, y: 0, z, yaw }));
+const TEAM_A = PIT([[194, 165], [194, 175], [192, 158], [192, 182]], -Math.PI / 2);
+const TEAM_B = PIT([[246, 165], [246, 175], [248, 158], [248, 182]], Math.PI / 2);
+const DUEL = { A: { x: 194, y: 0, z: 170, yaw: -Math.PI / 2 }, B: { x: 246, y: 0, z: 170, yaw: Math.PI / 2 } };
+
+const BOUND = 298;
+const TIER_HP = [140, 280, 420];
+const MAX_PIECES = 450;
+const FROZEN = ['countdown', 'intermission', 'ended'];
+
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
+const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+
+function parseLoadout(str) {
+  const p = String(str || '').split('.');
+  return SLOTS.map((slot, i) => (SLOT_OF[p[i]] === slot ? p[i] : DEFAULT_LO[i]));
+}
+function falloff(f, d) {
+  if (!f || d <= f[0]) return 1;
+  if (d >= f[1]) return f[2];
+  return 1 + (f[2] - 1) * ((d - f[0]) / (f[1] - f[0]));
+}
+/** attacker is behind the target (target faces -Z at yaw 0) */
+function isBehind(att, tgt) {
+  const fx = -Math.sin(tgt.yaw), fz = -Math.cos(tgt.yaw);
+  const dx = att.x - tgt.x, dz = att.z - tgt.z, l = Math.hypot(dx, dz) || 1;
+  return (fx * dx + fz * dz) / l < -0.15;
+}
+function cleanSpec(sp) {
+  if (!sp || typeof sp !== 'object') return null;
+  const type = sp.type;
+  if (type !== 'wall' && type !== 'floor' && type !== 'ramp') return null;
+  const ix = Math.round(num(sp.ix, NaN)), iz = Math.round(num(sp.iz, NaN)), lv = Math.round(num(sp.lv, NaN));
+  const o = Math.round(num(sp.o, NaN)), tier = Math.round(num(sp.tier, NaN));
+  if (![ix, iz, lv, o, tier].every(Number.isFinite)) return null;
+  if (Math.abs(ix) > 76 || Math.abs(iz) > 76 || lv < 0 || lv > 12 || tier < 0 || tier > 2) return null;
+  if ((type === 'wall' && (o < 0 || o > 1)) || (type === 'floor' && o !== 0) || (type === 'ramp' && (o < 0 || o > 3))) return null;
+  return { type, ix, iz, lv, o, tier };
+}
+const specKey = (s) => `${s.type}:${s.ix}:${s.iz}:${s.lv}:${s.o}`;
+
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
     this.sessions = new Map();
     this.chat = [];
+    this.builds = new Map();
+    this.cfg = null;
+    this.mode = 'custom';
+    this.phase = 'waiting';
+    this.phaseEnd = 0;
+    this.note = '';
+    this.winner = '';
+    this.round = 0;
+    this.wins = { A: 0, B: 0 };
+    this.timer = null;
   }
 
   async fetch(request) {
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket', { status: 426 });
-    }
-
+    if (request.headers.get('Upgrade') !== 'websocket') return new Response('Expected WebSocket', { status: 426 });
     const url = new URL(request.url);
-    const name = (url.searchParams.get('name') || 'Player').slice(0, 20);
+    const name = (url.searchParams.get('name') || 'Player').replace(/[^\w .\-]/g, '').trim().slice(0, 20) || 'Player';
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.handleSession(server, name);
+    this.handleSession(server, name, url.searchParams.get('mode'), parseLoadout(url.searchParams.get('lo')));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  handleSession(ws, name) {
-    ws.accept();
-    const id = crypto.randomUUID().slice(0, 8);
-    const session = {
-      id,
-      ws,
-      name,
-      x: (Math.random() - 0.5) * 10,
-      z: 6 + Math.random() * 4,
-      yaw: 0,
-      pitch: 0,
-      hp: 100,
-      alive: true,
-      ads: false,
-      thirdPerson: true,
-    };
-    this.sessions.set(id, session);
-
-    this.send(ws, {
-      type: 'welcome',
-      id,
-      name,
-      players: this.snapshot(id),
-      chat: this.chat.slice(-30),
-    });
-
-    this.broadcast({ type: 'join', player: this.publicPlayer(session) }, id);
-    this.systemChat(`${name} joined`);
-
-    ws.addEventListener('message', (evt) => {
-      let msg;
-      try {
-        msg = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
-      } catch {
-        return;
-      }
-      this.onMessage(session, msg);
-    });
-
-    ws.addEventListener('close', () => {
-      this.sessions.delete(id);
-      this.broadcast({ type: 'leave', id });
-      this.systemChat(`${name} left`);
-    });
-
-    ws.addEventListener('error', () => {
-      try {
-        ws.close();
-      } catch (_) {}
-      this.sessions.delete(id);
-    });
+  // ---------- sessions ----------
+  initRoom(modeParam) {
+    this.mode = MODES[modeParam] ? modeParam : 'custom';
+    this.cfg = MODES[this.mode];
+    this.phase = 'waiting'; this.round = 0; this.wins = { A: 0, B: 0 }; this.note = ''; this.winner = '';
+    this.timer = setInterval(() => this.tick(), 200);
   }
 
-  onMessage(session, msg) {
-    if (!msg || typeof msg.type !== 'string') return;
+  shutdown() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.cfg = null;
+    this.builds.clear();
+    this.chat = [];
+  }
 
+  handleSession(ws, name, modeParam, lo) {
+    ws.accept();
+    if (!this.cfg) this.initRoom(modeParam);
+    if (this.sessions.size >= this.cfg.cap) {
+      this.send(ws, { type: 'full' });
+      try { ws.close(1000, 'full'); } catch (_) {}
+      if (!this.sessions.size) this.shutdown();
+      return;
+    }
+    const id = crypto.randomUUID().slice(0, 8);
+    const s = {
+      id, ws, name, team: this.cfg.teams ? this.pickTeam() : null,
+      x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, alive: true,
+      ads: false, crouch: false, sprint: false, rl: false, lo, weapon: lo[0],
+      k: 0, d: 0, protectUntil: 0, respawnAt: 0, lastShot: 0, lastMelee: 0, lastThrow: 0, lastBd: 0, buildTimes: [],
+    };
+    this.sessions.set(id, s);
+    this.placePlayer(s, false, 0);
+
+    this.send(ws, {
+      type: 'welcome', id, name, team: s.team, mode: this.mode, cap: this.cfg.cap, target: this.cfg.target || this.cfg.win || 0,
+      spawn: { x: s.x, y: s.y, z: s.z, yaw: s.yaw }, hp: s.hp,
+      players: this.snapshot(id), chat: this.chat.slice(-30),
+      builds: [...this.builds.values()].map((b) => b.spec),
+      phase: this.phasePayload(), scores: this.scoreList(),
+    });
+    this.broadcast({ type: 'join', player: this.publicPlayer(s) }, id);
+    this.systemChat(`${name} joined`);
+    this.broadcastScores();
+    this.broadcastPhase();
+
+    ws.addEventListener('message', (evt) => {
+      if (typeof evt.data === 'string' && evt.data.length > 4000) return;
+      let msg;
+      try { msg = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data)); } catch { return; }
+      this.onMessage(s, msg);
+    });
+    const leave = () => {
+      if (!this.sessions.delete(id)) return;
+      this.broadcast({ type: 'leave', id });
+      this.systemChat(`${name} left`);
+      this.broadcastScores();
+      if (!this.sessions.size) this.shutdown();
+    };
+    ws.addEventListener('close', leave);
+    ws.addEventListener('error', () => { try { ws.close(); } catch (_) {} leave(); });
+  }
+
+  pickTeam() {
+    let a = 0, b = 0;
+    for (const s of this.sessions.values()) { if (s.team === 'A') a++; else if (s.team === 'B') b++; }
+    return b < a ? 'B' : 'A';
+  }
+
+  spawnFor(s) {
+    if (this.cfg.teams) {
+      if (this.mode === 'duel') return DUEL[s.team] || DUEL.A;
+      const list = s.team === 'A' ? TEAM_A : TEAM_B;
+      const idx = [...this.sessions.values()].filter((o) => o.team === s.team).indexOf(s);
+      return list[Math.max(0, idx) % list.length];
+    }
+    const others = [...this.sessions.values()].filter((o) => o !== s && o.alive);
+    let best = FFA[0], bd = -1;
+    for (const sp of FFA) {
+      let md = 1e9;
+      for (const o of others) md = Math.min(md, Math.hypot(o.x - sp.x, o.z - sp.z));
+      md += Math.random() * 25;
+      if (md > bd) { bd = md; best = sp; }
+    }
+    return best;
+  }
+
+  placePlayer(s, notify, protectMs) {
+    const sp = this.spawnFor(s);
+    s.x = sp.x; s.y = sp.y; s.z = sp.z; s.yaw = sp.yaw; s.pitch = 0;
+    s.hp = 100; s.alive = true; s.rl = false; s.respawnAt = 0;
+    s.protectUntil = Date.now() + protectMs;
+    if (!notify) return;
+    this.send(s.ws, { type: 'spawn', x: s.x, y: s.y, z: s.z, yaw: s.yaw, hp: 100, protect: protectMs });
+    this.broadcast({ ...this.stateMsg(s) }, s.id);
+    this.broadcast({ type: 'hp', id: s.id, hp: 100, alive: true });
+  }
+
+  // ---------- messages ----------
+  onMessage(s, msg) {
+    if (!msg || typeof msg.type !== 'string') return;
+    const now = Date.now();
     switch (msg.type) {
       case 'state': {
-        if (typeof msg.x === 'number') session.x = clamp(msg.x, -95, 95);
-        if (typeof msg.z === 'number') session.z = clamp(msg.z, -95, 95);
-        if (typeof msg.yaw === 'number') session.yaw = msg.yaw;
-        if (typeof msg.pitch === 'number') session.pitch = clamp(msg.pitch, -1.2, 1.2);
-        if (typeof msg.hp === 'number') session.hp = clamp(msg.hp, 0, 100);
-        if (typeof msg.alive === 'boolean') session.alive = msg.alive;
-        if (typeof msg.ads === 'boolean') session.ads = msg.ads;
-        if (typeof msg.thirdPerson === 'boolean') session.thirdPerson = msg.thirdPerson;
-        this.broadcast(
-          {
-            type: 'state',
-            id: session.id,
-            x: session.x,
-            z: session.z,
-            yaw: session.yaw,
-            pitch: session.pitch,
-            hp: session.hp,
-            alive: session.alive,
-            ads: session.ads,
-            thirdPerson: session.thirdPerson,
-          },
-          session.id
-        );
+        if (!FROZEN.includes(this.phase) && s.alive) {
+          s.x = clamp(num(msg.x, s.x), -BOUND, BOUND);
+          s.y = clamp(num(msg.y, s.y), 0, 80);
+          s.z = clamp(num(msg.z, s.z), -BOUND, BOUND);
+          s.yaw = num(msg.yaw, s.yaw);
+          s.pitch = clamp(num(msg.pitch, s.pitch), -1.5, 1.5);
+        }
+        s.ads = !!msg.ads; s.crouch = !!msg.crouch; s.sprint = !!msg.sprint; s.rl = !!msg.rl;
+        if (typeof msg.weapon === 'string' && s.lo.includes(msg.weapon)) s.weapon = msg.weapon;
+        this.broadcast(this.stateMsg(s), s.id);
         break;
       }
       case 'shoot': {
-        this.broadcast(
-          {
-            type: 'shoot',
-            id: session.id,
-            ox: msg.ox,
-            oy: msg.oy,
-            oz: msg.oz,
-            dx: msg.dx,
-            dy: msg.dy,
-            dz: msg.dz,
-          },
-          session.id
-        );
-        if (msg.targetId && this.sessions.has(msg.targetId)) {
-          const target = this.sessions.get(msg.targetId);
-          if (target.alive) {
-            const dmg = typeof msg.dmg === 'number' ? clamp(msg.dmg, 1, 40) : 16;
-            target.hp = Math.max(0, target.hp - dmg);
-            if (target.hp <= 0) {
-              target.alive = false;
-              target.hp = 0;
-            }
-            this.send(target.ws, {
-              type: 'damage',
-              from: session.id,
-              hp: target.hp,
-              alive: target.alive,
-              dmg,
-            });
-            this.broadcast({
-              type: 'hp',
-              id: target.id,
-              hp: target.hp,
-              alive: target.alive,
-            });
-            if (!target.alive) {
-              this.systemChat(`${session.name} eliminated ${target.name}`);
-              this.send(target.ws, { type: 'respawn_in', ms: 2000 });
-            }
-          }
+        const gun = GUNS[msg.weapon];
+        if (!gun || !s.alive || !s.lo.includes(msg.weapon)) break;
+        if (now - s.lastShot < gun.cd * 550) break;
+        s.lastShot = now;
+        this.broadcast({
+          type: 'shoot', id: s.id, weapon: msg.weapon,
+          ox: num(msg.ox), oy: num(msg.oy), oz: num(msg.oz), dx: num(msg.dx), dy: num(msg.dy), dz: num(msg.dz),
+        }, s.id);
+        if (this.phase !== 'live' || !Array.isArray(msg.hits)) break;
+        for (const h of msg.hits.slice(0, 12)) {
+          const t = this.sessions.get(h && h.id);
+          if (!t || t === s) continue;
+          const n = clamp(Math.round(num(h.n, 1)), 1, gun.pellets);
+          const zone = h.zone === 'head' ? 'head' : h.zone === 'limb' ? 'limb' : 'body';
+          this.applyDamage(s, t, gun[zone] * falloff(gun.fall, dist3(s, t)) * n, { weapon: msg.weapon, head: zone === 'head' });
         }
         break;
       }
-      case 'respawn': {
-        session.alive = true;
-        session.hp = 100;
-        session.x = (Math.random() - 0.5) * 12;
-        session.z = 4 + Math.random() * 8;
-        this.broadcast({
-          type: 'state',
-          id: session.id,
-          x: session.x,
-          z: session.z,
-          yaw: session.yaw,
-          pitch: 0,
-          hp: 100,
-          alive: true,
-          ads: false,
-          thirdPerson: session.thirdPerson,
-        });
+      case 'melee': {
+        const m = MELEE[msg.weapon];
+        if (!m || !s.alive || !s.lo.includes(msg.weapon)) break;
+        const thrown = !!msg.thrown && !!m.thrown;
+        if (thrown) { if (now - s.lastThrow < m.throwCd * 600) break; s.lastThrow = now; }
+        else { if (now - s.lastMelee < m.cd * 600) break; s.lastMelee = now; }
+        this.broadcast({ type: 'melee', id: s.id, weapon: msg.weapon, thrown }, s.id);
+        const t = this.sessions.get(msg.id);
+        if (this.phase !== 'live' || !t || t === s) break;
+        if (dist3(s, t) > (thrown ? m.throwRange + 6 : m.range + 1.5)) break;
+        let dmg;
+        if (thrown) dmg = m.thrown;
+        else if (m.back && isBehind(s, t)) dmg = m.back;
+        else dmg = msg.zone === 'head' ? m.head : m.front;
+        this.applyDamage(s, t, dmg, { weapon: msg.weapon, head: !thrown && msg.zone === 'head', heal: m.heal });
         break;
       }
+      case 'loadout': {
+        s.lo = parseLoadout(Array.isArray(msg.lo) ? msg.lo.join('.') : msg.lo);
+        if (!s.lo.includes(s.weapon)) s.weapon = s.lo[0];
+        break;
+      }
+      case 'build': {
+        s.buildTimes = s.buildTimes.filter((t) => now - t < 1000);
+        if (s.buildTimes.length >= 16 || !s.alive) break;
+        s.buildTimes.push(now);
+        const spec = cleanSpec(msg.spec);
+        if (!spec) break;
+        const key = specKey(spec);
+        if (this.builds.has(key)) break;
+        this.builds.set(key, { spec, hp: TIER_HP[spec.tier] });
+        if (this.builds.size > MAX_PIECES) this.builds.delete(this.builds.keys().next().value);
+        this.broadcast({ type: 'bplace', spec }, s.id);
+        break;
+      }
+      case 'bdmg': {
+        const piece = this.builds.get(String(msg.key));
+        if (!piece) { this.send(s.ws, { type: 'bbreak', key: String(msg.key) }); break; }
+        const g = GUNS[msg.weapon], m = MELEE[msg.weapon];
+        if ((!g && !m) || !s.lo.includes(msg.weapon)) break;
+        if (now - s.lastBd < ((g ? g.cd : m.cd) * 1000) * 0.5) break;
+        s.lastBd = now;
+        let dmg;
+        if (g) dmg = g.body * clamp(Math.round(num(msg.n, 1)), 1, g.pellets);
+        else {
+          if (Math.hypot(s.x - piece.spec.ix * 4, s.z - piece.spec.iz * 4) > 11) break;
+          dmg = m.demolish ? 99999 : m.front;
+        }
+        piece.hp -= dmg;
+        this.broadcast({ type: 'bhit', key: String(msg.key), dmg });
+        if (piece.hp <= 0) {
+          this.builds.delete(String(msg.key));
+          this.broadcast({ type: 'bbreak', key: String(msg.key) });
+        }
+        break;
+      }
+      case 'respawn': break; // the server respawns players itself
       case 'chat': {
         const text = String(msg.text || '').trim().slice(0, 200);
         if (!text) return;
-        const entry = {
-          type: 'chat',
-          id: session.id,
-          name: session.name,
-          text,
-          t: Date.now(),
-        };
+        const entry = { type: 'chat', id: s.id, name: s.name, text, t: now };
         this.chat.push(entry);
         if (this.chat.length > 40) this.chat.shift();
         this.broadcast(entry);
         break;
       }
-      default:
-        break;
+      default: break;
     }
   }
 
-  publicPlayer(s) {
+  // ---------- combat ----------
+  applyDamage(att, tgt, dmg, info) {
+    if (this.phase !== 'live' || !tgt.alive || !att.alive || att === tgt) return;
+    if (Date.now() < tgt.protectUntil) return;
+    if (this.cfg.teams && att.team === tgt.team) return;
+    dmg = Math.max(1, Math.round(dmg));
+    tgt.hp = Math.max(0, tgt.hp - dmg);
+    this.send(tgt.ws, { type: 'damage', from: att.id, hp: tgt.hp, alive: tgt.hp > 0, dmg, weapon: info.weapon });
+    this.broadcast({ type: 'hp', id: tgt.id, hp: tgt.hp, alive: tgt.hp > 0 });
+    if (tgt.hp <= 0) this.kill(att, tgt, info);
+  }
+
+  kill(att, tgt, info) {
+    tgt.alive = false; tgt.hp = 0; tgt.d++; att.k++;
+    this.broadcast({ type: 'kill', killer: att.id, kname: att.name, victim: tgt.id, vname: tgt.name, weapon: info.weapon || '', head: !!info.head });
+    if (info.heal) {
+      att.hp = Math.min(100, att.hp + info.heal);
+      this.send(att.ws, { type: 'heal', hp: att.hp });
+      this.broadcast({ type: 'hp', id: att.id, hp: att.hp, alive: true });
+    }
+    if (!this.cfg.rounds) {
+      tgt.respawnAt = Date.now() + this.cfg.respawn;
+      this.send(tgt.ws, { type: 'respawn_in', ms: this.cfg.respawn });
+    }
+    this.broadcastScores();
+    this.checkEnd();
+  }
+
+  // ---------- match flow ----------
+  phasePayload() {
     return {
-      id: s.id,
-      name: s.name,
-      x: s.x,
-      z: s.z,
-      yaw: s.yaw,
-      pitch: s.pitch,
-      hp: s.hp,
-      alive: s.alive,
-      ads: s.ads,
-      thirdPerson: s.thirdPerson,
+      type: 'phase', phase: this.phase, round: this.round, wins: this.wins,
+      t: Math.max(0, (this.phaseEnd - Date.now()) / 1000), note: this.note, winner: this.winner,
+      have: this.sessions.size, need: this.cfg ? this.cfg.min : 1,
     };
   }
+  broadcastPhase() { this.broadcast(this.phasePayload()); }
+  setPhase(p, secs, o = {}) {
+    this.phase = p;
+    this.phaseEnd = Date.now() + secs * 1000;
+    this.note = o.note || '';
+    this.winner = o.winner || '';
+    this.broadcastPhase();
+  }
 
+  resetScores() {
+    for (const s of this.sessions.values()) { s.k = 0; s.d = 0; }
+    this.wins = { A: 0, B: 0 };
+    this.round = 0;
+  }
+  startMatch() { this.resetScores(); this.broadcastScores(); this.startRound(); }
+  startRound() {
+    this.round++;
+    this.builds.clear();
+    this.broadcast({ type: 'bclear' });
+    for (const s of this.sessions.values()) this.placePlayer(s, true, 0);
+    this.setPhase('countdown', 3);
+  }
+  toWaiting(note) {
+    this.resetScores();
+    this.broadcastScores();
+    this.setPhase('waiting', 0, { note });
+  }
+
+  checkEnd() {
+    if (this.phase !== 'live') return;
+    const cfg = this.cfg;
+    if (!cfg.rounds) {
+      let top = null;
+      for (const s of this.sessions.values()) if (!top || s.k > top.k) top = s;
+      if (top && top.k >= cfg.target) this.setPhase('ended', 9, { winner: top.name });
+      return;
+    }
+    const alive = { A: 0, B: 0 }, total = { A: 0, B: 0 };
+    for (const s of this.sessions.values()) { total[s.team]++; if (s.alive) alive[s.team]++; }
+    if (!total.A || !total.B) return;
+    if (!alive.A && !alive.B) this.endRound(null);
+    else if (!alive.A) this.endRound('B');
+    else if (!alive.B) this.endRound('A');
+  }
+
+  endRound(team) {
+    if (team) this.wins[team]++;
+    const label = (t) => {
+      if (this.mode === 'duel') { for (const s of this.sessions.values()) if (s.team === t) return s.name; }
+      return `Team ${t}`;
+    };
+    if (team && this.wins[team] >= this.cfg.win) this.setPhase('ended', 9, { winner: label(team) });
+    else this.setPhase('intermission', 4, { note: team ? `${label(team)} takes the round` : 'Draw' });
+  }
+
+  tick() {
+    const cfg = this.cfg;
+    if (!cfg) return;
+    const now = Date.now(), n = this.sessions.size;
+    if (!cfg.rounds && this.phase === 'live') {
+      for (const s of this.sessions.values()) if (!s.alive && s.respawnAt && now >= s.respawnAt) this.placePlayer(s, true, 2000);
+    }
+    switch (this.phase) {
+      case 'waiting': if (n >= cfg.min) this.startMatch(); break;
+      case 'countdown':
+        if (n < cfg.min) this.toWaiting('A player left');
+        else if (now >= this.phaseEnd) this.setPhase('live', 0);
+        break;
+      case 'live': if (n < cfg.min) this.toWaiting('A player left'); else this.checkEnd(); break;
+      case 'intermission':
+        if (n < cfg.min) this.toWaiting('A player left');
+        else if (now >= this.phaseEnd) this.startRound();
+        break;
+      case 'ended':
+        if (now >= this.phaseEnd) { if (n >= cfg.min) this.startMatch(); else this.toWaiting(''); }
+        break;
+      default: break;
+    }
+  }
+
+  // ---------- views ----------
+  stateMsg(s) {
+    return {
+      type: 'state', id: s.id, x: s.x, y: s.y, z: s.z, yaw: s.yaw, pitch: s.pitch,
+      ads: s.ads, crouch: s.crouch, sprint: s.sprint, rl: s.rl, weapon: s.weapon, hp: s.hp, alive: s.alive,
+    };
+  }
+  publicPlayer(s) {
+    return { ...this.stateMsg(s), type: undefined, name: s.name, team: s.team, k: s.k, d: s.d };
+  }
   snapshot(exceptId) {
     const list = [];
-    for (const s of this.sessions.values()) {
-      if (s.id === exceptId) continue;
-      list.push(this.publicPlayer(s));
-    }
+    for (const s of this.sessions.values()) if (s.id !== exceptId) list.push(this.publicPlayer(s));
     return list;
+  }
+  scoreList() {
+    return [...this.sessions.values()].map((s) => ({ id: s.id, name: s.name, k: s.k, d: s.d, team: s.team }));
+  }
+  broadcastScores() {
+    if (!this.cfg) return;
+    this.broadcast({ type: 'scores', list: this.scoreList(), target: this.cfg.target || this.cfg.win || 0 });
   }
 
   systemChat(text) {
@@ -273,24 +492,14 @@ export class GameRoom {
     if (this.chat.length > 40) this.chat.shift();
     this.broadcast(entry);
   }
-
   send(ws, obj) {
-    try {
-      ws.send(JSON.stringify(obj));
-    } catch (_) {}
+    try { ws.send(JSON.stringify(obj)); } catch (_) {}
   }
-
   broadcast(obj, exceptId = null) {
     const data = JSON.stringify(obj);
     for (const s of this.sessions.values()) {
       if (s.id === exceptId) continue;
-      try {
-        s.ws.send(data);
-      } catch (_) {}
+      try { s.ws.send(data); } catch (_) {}
     }
   }
 }
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-      }
