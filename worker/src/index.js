@@ -137,7 +137,7 @@ export class GameRoom {
     const name = (url.searchParams.get('name') || 'Player').replace(/[^\w .\-]/g, '').trim().slice(0, 20) || 'Player';
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.handleSession(server, name, url.searchParams.get('mode'), parseLoadout(url.searchParams.get('lo')));
+    this.handleSession(server, name, url.searchParams.get('mode'), parseLoadout(url.searchParams.get('lo')), String(url.searchParams.get('lk') || '').replace(/[^0-9.]/g, '').slice(0, 40));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -157,8 +157,8 @@ export class GameRoom {
     this.chat = [];
   }
 
-  handleSession(ws, name, modeParam, lo) {
-    ws.accept();
+handleSession(ws, name, modeParam, lo, lk = '') {
+  ws.accept();
     if (!this.cfg) this.initRoom(modeParam);
     if (this.sessions.size >= this.cfg.cap) {
       this.send(ws, { type: 'full' });
@@ -168,7 +168,7 @@ export class GameRoom {
     }
     const id = crypto.randomUUID().slice(0, 8);
     const s = {
-      id, ws, name, team: this.cfg.teams ? this.pickTeam() : null,
+      id, ws, name, lk, team: this.cfg.teams ? this.pickTeam() : null,
       x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, alive: true,
       ads: false, crouch: false, sprint: false, rl: false, lo, weapon: lo[0],
       k: 0, d: 0, protectUntil: 0, respawnAt: 0, lastShot: 0, lastMelee: 0, lastThrow: 0, lastBd: 0, buildTimes: [],
@@ -471,7 +471,7 @@ export class GameRoom {
     };
   }
   publicPlayer(s) {
-    return { ...this.stateMsg(s), type: undefined, name: s.name, team: s.team, k: s.k, d: s.d };
+    return { ...this.stateMsg(s), type: undefined, name: s.name, team: s.team, k: s.k, d: s.d, lk: s.lk };
   }
   snapshot(exceptId) {
     const list = [];
