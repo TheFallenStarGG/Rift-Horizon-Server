@@ -11,7 +11,7 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors() });
     if (url.pathname === '/' || url.pathname === '/health') return json({ ok: true, service: 'fps-game-server' });
 
-    // Proxy recording upload to Catbox / Litterbox (no R2). Catbox first; Litterbox on failure.
+    // Proxy recording upload — try several free hosts (no account / no card)
     if (url.pathname === '/api/rec' && request.method === 'PUT') {
       try {
         let name = (url.searchParams.get('name') || '').replace(/[^a-zA-Z0-9._-]/g, '');
@@ -20,16 +20,61 @@ export default {
         const buf = await request.arrayBuffer();
         if (!buf.byteLength) return json({ error: 'empty body' }, 400);
         if (buf.byteLength > 1024 * 1024 * 1024) return json({ error: 'file too large (max 1GB)' }, 413);
-        const prefer = url.searchParams.get('host');
+        const prefer = (url.searchParams.get('host') || 'auto').toLowerCase();
         const type = request.headers.get('Content-Type') || (name.endsWith('.webm') ? 'video/webm' : 'video/mp4');
-        const forceLitter = prefer === 'litterbox' || buf.byteLength > 200 * 1024 * 1024;
+        const blob = new Blob([buf], { type });
+        const errors = [];
 
-        async function postTo(useLitter) {
+        async function tryGofile() {
+          const srvRes = await fetch('https://api.gofile.io/servers');
+          const srv = await srvRes.json();
+          const server = srv?.data?.servers?.[0]?.name;
+          if (!server) throw new Error('no gofile server');
+          const form = new FormData();
+          form.append('file', blob, name);
+          const up = await fetch(`https://${server}.gofile.io/uploadFile`, { method: 'POST', body: form });
+          const j = await up.json();
+          const page = j?.data?.downloadPage || j?.data?.directLink;
+          if (!page) throw new Error(JSON.stringify(j).slice(0, 120));
+          return { ok: true, url: page, host: 'gofile', expires: '' };
+        }
+
+        async function try0x0() {
+          const form = new FormData();
+          form.append('file', blob, name);
+          const up = await fetch('https://0x0.st', { method: 'POST', body: form });
+          const text = (await up.text()).trim();
+          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || '0x0 rejected');
+          return { ok: true, url: text, host: '0x0', expires: '' };
+        }
+
+        async function tryTmpfiles() {
+          const form = new FormData();
+          form.append('file', blob, name);
+          const up = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: form });
+          const j = await up.json();
+          let u = j?.data?.url;
+          if (!u) throw new Error(JSON.stringify(j).slice(0, 120));
+          u = String(u).replace('http://', 'https://');
+          if (/tmpfiles\.org\/\d+\//.test(u)) u = u.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+          return { ok: true, url: u, host: 'tmpfiles', expires: '~1 hour' };
+        }
+
+        async function tryFileIo() {
+          const form = new FormData();
+          form.append('file', blob, name);
+          const up = await fetch('https://file.io/?expires=7d', { method: 'POST', body: form });
+          const j = await up.json();
+          if (!j?.success || !j?.link) throw new Error(JSON.stringify(j).slice(0, 120));
+          return { ok: true, url: j.link, host: 'file.io', expires: j.expiry || '7 days' };
+        }
+
+        async function tryCatbox(litter) {
           const form = new FormData();
           form.append('reqtype', 'fileupload');
-          form.append('fileToUpload', new Blob([buf], { type }), name);
+          form.append('fileToUpload', blob, name);
           let endpoint;
-          if (useLitter) {
+          if (litter) {
             form.append('time', '72h');
             endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
           } else {
@@ -37,37 +82,45 @@ export default {
           }
           const up = await fetch(endpoint, { method: 'POST', body: form });
           const text = (await up.text()).trim();
-          if (!up.ok || !/^https?:\/\//i.test(text)) {
-            throw new Error(text.slice(0, 200) || 'upload rejected');
-          }
+          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || 'catbox rejected');
           return {
             ok: true,
             url: text,
-            host: useLitter ? 'litterbox' : 'catbox',
-            expires: useLitter ? '72 hours' : '',
+            host: litter ? 'litterbox' : 'catbox',
+            expires: litter ? '72 hours' : '',
           };
         }
 
-        if (!forceLitter) {
+        const chain = [];
+        if (prefer === 'gofile') chain.push(['gofile', tryGofile]);
+        else if (prefer === '0x0') chain.push(['0x0', try0x0]);
+        else if (prefer === 'tmpfiles') chain.push(['tmpfiles', tryTmpfiles]);
+        else if (prefer === 'fileio' || prefer === 'file.io') chain.push(['file.io', tryFileIo]);
+        else if (prefer === 'litterbox') chain.push(['litterbox', () => tryCatbox(true)]);
+        else if (prefer === 'catbox') chain.push(['catbox', () => tryCatbox(false)]);
+        else {
+          chain.push(
+            ['gofile', tryGofile],
+            ['0x0', try0x0],
+            ['tmpfiles', tryTmpfiles],
+            ['file.io', tryFileIo],
+            ['catbox', () => tryCatbox(false)],
+            ['litterbox', () => tryCatbox(true)],
+          );
+        }
+
+        for (const [label, fn] of chain) {
           try {
-            return json(await postTo(false));
+            return json(await fn());
           } catch (e) {
-            try {
-              return json(await postTo(true));
-            } catch (e2) {
-              return json({ error: String(e2.message || e2) }, 502);
-            }
+            errors.push(label + ': ' + String(e.message || e).slice(0, 80));
           }
         }
-        try {
-          return json(await postTo(true));
-        } catch (e) {
-          return json({ error: String(e.message || e) }, 502);
-        }
+        return json({ error: errors.join(' | ') || 'all hosts failed' }, 502);
       } catch (e) {
         return json({ error: String(e.message || e) }, 500);
       }
-    }
+  }
 
     if (url.pathname === '/ws') {
       const room = (url.searchParams.get('room') || 'lobby').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24) || 'lobby';
