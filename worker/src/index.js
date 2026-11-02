@@ -1,6 +1,6 @@
 /**
  * Realm Range multiplayer — Cloudflare Worker + Durable Object rooms (class GameRoom, binding ROOM: unchanged).
- * Client: wss://<worker>/ws?room=CODE&name=Player&mode=ffa|duel|team|custom&lo=main.side.melee
+ * Client: wss://<worker>/ws?room=CODE&name=Player&mode=ffa|duel|team|custom|lobby&lo=main.side.melee
  * The server owns health, damage, kills, rounds, respawns and builds.
  * KEEP the GUNS / MELEE tables in sync with lib/arsenal.js in the client repo.
  */
@@ -129,6 +129,7 @@ const MODES = {
   custom: { cap: 12, min: 1, teams: false, rounds: false, target: 30, respawn: 3000 },
   duel: { cap: 2, min: 2, teams: true, rounds: true, win: 3, respawn: 0 },
   team: { cap: 4, min: 4, teams: true, rounds: true, win: 3, respawn: 0 },
+  lobby: { cap: 60, min: 0, teams: false, rounds: false, target: 0, respawn: 0, social: true },
 };
 
 // spawn points (mirror lib/scene.js SPAWNS; the Pit arena is at x 220, z 170)
@@ -138,6 +139,8 @@ const PIT = (pts, yaw) => pts.map(([x, z]) => ({ x, y: 0, z, yaw }));
 const TEAM_A = PIT([[194, 165], [194, 175], [192, 158], [192, 182]], -Math.PI / 2);
 const TEAM_B = PIT([[246, 165], [246, 175], [248, 158], [248, 182]], Math.PI / 2);
 const DUEL = { A: { x: 194, y: 0, z: 170, yaw: -Math.PI / 2 }, B: { x: 246, y: 0, z: 170, yaw: Math.PI / 2 } };
+// the shared lobby hall floats at y 400 (mirror LOBBY_SPAWN in lib/lobby.js)
+const LOBBY_SPAWN = { x: -240, y: 400, z: 256, yaw: 0 };
 
 const BOUND = 298;
 const TIER_HP = [140, 280, 420];
@@ -247,7 +250,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
       phase: this.phasePayload(), scores: this.scoreList(),
     });
     this.broadcast({ type: 'join', player: this.publicPlayer(s) }, id);
-    this.systemChat(`${name} joined`);
+    if (!this.cfg.social) this.systemChat(`${name} joined`);
     this.broadcastScores();
     this.broadcastPhase();
 
@@ -260,7 +263,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
     const leave = () => {
       if (!this.sessions.delete(id)) return;
       this.broadcast({ type: 'leave', id });
-      this.systemChat(`${name} left`);
+      if (!this.cfg.social) this.systemChat(`${name} left`);
       this.broadcastScores();
       if (!this.sessions.size) this.shutdown();
     };
@@ -275,6 +278,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
   }
 
   spawnFor(s) {
+    if (this.cfg.social) return LOBBY_SPAWN;
     if (this.cfg.teams) {
       if (this.mode === 'duel') return DUEL[s.team] || DUEL.A;
       const list = s.team === 'A' ? TEAM_A : TEAM_B;
@@ -311,7 +315,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
       case 'state': {
         if (!FROZEN.includes(this.phase) && s.alive) {
           s.x = clamp(num(msg.x, s.x), -BOUND, BOUND);
-          s.y = clamp(num(msg.y, s.y), 0, 80);
+          s.y = clamp(num(msg.y, s.y), 0, this.cfg.social ? 500 : 80);
           s.z = clamp(num(msg.z, s.z), -BOUND, BOUND);
           s.yaw = num(msg.yaw, s.yaw);
           s.pitch = clamp(num(msg.pitch, s.pitch), -1.5, 1.5);
@@ -363,6 +367,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
         break;
       }
       case 'build': {
+        if (this.cfg.social) break;
         s.buildTimes = s.buildTimes.filter((t) => now - t < 1000);
         if (s.buildTimes.length >= 16 || !s.alive) break;
         s.buildTimes.push(now);
@@ -503,7 +508,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
 
   tick() {
     const cfg = this.cfg;
-    if (!cfg) return;
+    if (!cfg || cfg.social) return;
     const now = Date.now(), n = this.sessions.size;
     if (!cfg.rounds && this.phase === 'live') {
       for (const s of this.sessions.values()) if (!s.alive && s.respawnAt && now >= s.respawnAt) this.placePlayer(s, true, 2000);
