@@ -178,6 +178,7 @@ const SLOTS = ['main', 'side', 'melee'];
 const DEFAULT_LO = ['vanguard', 'p9', 'knife'];
 
 const MODES = {
+  bots: { cap: 4, min: 1, teams: false, rounds: false, target: 0, respawn: 0, botArena: true },
   ffa: { cap: 8, min: 1, teams: false, rounds: false, target: 20, respawn: 3000 },
   custom: { cap: 12, min: 1, teams: false, rounds: false, target: 30, respawn: 3000 },
   duel: { cap: 2, min: 2, teams: true, rounds: true, win: 3, respawn: 0 },
@@ -232,7 +233,15 @@ function cleanSpec(sp) {
 }
 const specKey = (s) => `${s.type}:${s.ix}:${s.iz}:${s.lv}:${s.o}`;
 
+const BOT_SPAWNS = [
+  { x: 80, y: 2, z: 80 }, { x: -80, y: 2, z: 80 }, { x: 80, y: 2, z: -80 }, { x: -80, y: 2, z: -80 },
+  { x: 120, y: 2, z: 0 }, { x: -120, y: 2, z: 0 }, { x: 0, y: 2, z: 120 }, { x: 0, y: 2, z: -120 },
+  { x: 200, y: 2, z: 40 }, { x: -200, y: 2, z: -40 }, { x: 40, y: 2, z: 200 }, { x: -40, y: 2, z: -200 },
+  { x: 150, y: 2, z: 150 }, { x: -150, y: 2, z: 150 }, { x: 150, y: 2, z: -150 }, { x: -150, y: 2, z: -150 },
+];
+
 export class GameRoom {
+
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -248,6 +257,8 @@ export class GameRoom {
     this.round = 0;
     this.wins = { A: 0, B: 0 };
     this.timer = null;
+    this.bots = [];
+    this.botCfg = { teams: 2, size: 6, leaders: 1 };
   }
 
   async fetch(request) {
@@ -256,7 +267,7 @@ export class GameRoom {
     const name = (url.searchParams.get('name') || 'Player').replace(/[^\w .\-]/g, '').trim().slice(0, 20) || 'Player';
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.handleSession(server, name, url.searchParams.get('mode'), parseLoadout(url.searchParams.get('lo')), String(url.searchParams.get('lk') || '').replace(/[^0-9.]/g, '').slice(0, 40));
+    this.handleSession(server, name, url.searchParams);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -274,11 +285,26 @@ export class GameRoom {
     this.cfg = null;
     this.builds.clear();
     this.chat = [];
+    this.bots = [];
   }
 
-handleSession(ws, name, modeParam, lo, lk = '') {
-  ws.accept();
-    if (!this.cfg) this.initRoom(modeParam);
+handleSession(ws, name, params) {
+    ws.accept();
+    const modeParam = params.get('mode') || 'custom';
+    const lo = parseLoadout(params.get('lo'));
+    const lk = String(params.get('lk') || '').replace(/[^0-9.]/g, '').slice(0, 40);
+    if (!this.cfg) {
+      this.initRoom(modeParam);
+      if (this.cfg.botArena) {
+        this.botCfg = {
+          teams: Math.max(2, Math.min(4, parseInt(params.get('teams') || '2', 10) || 2)),
+          size: Math.max(4, Math.min(10, parseInt(params.get('size') || '6', 10) || 6)),
+          leaders: Math.max(1, Math.min(3, parseInt(params.get('leaders') || '1', 10) || 1)),
+        };
+        this.spawnArenaBots();
+        this.setPhase('live', 0);
+      }
+    }
     if (this.sessions.size >= this.cfg.cap) {
       this.send(ws, { type: 'full' });
       try { ws.close(1000, 'full'); } catch (_) {}
@@ -454,6 +480,8 @@ handleSession(ws, name, modeParam, lo, lk = '') {
         }
         break;
       }
+      case 'bot_order': this.applyBotOrder(msg); break;
+      case 'bot_hit': this.hitBot(msg, s); break;
       case 'respawn': break; // the server respawns players itself
       case 'chat': {
         const text = String(msg.text || '').trim().slice(0, 200);
@@ -562,6 +590,7 @@ handleSession(ws, name, modeParam, lo, lk = '') {
   tick() {
     const cfg = this.cfg;
     if (!cfg || cfg.social) return;
+    if (cfg.botArena) this.tickBots();
     const now = Date.now(), n = this.sessions.size;
     if (!cfg.rounds && this.phase === 'live') {
       for (const s of this.sessions.values()) if (!s.alive && s.respawnAt && now >= s.respawnAt) this.placePlayer(s, true, 2000);
@@ -613,6 +642,173 @@ handleSession(ws, name, modeParam, lo, lk = '') {
     if (this.chat.length > 40) this.chat.shift();
     this.broadcast(entry);
   }
+
+  // ---------- bot arena (server followers) ----------
+  spawnArenaBots() {
+    this.bots = [];
+    const { teams, size, leaders } = this.botCfg;
+    let n = 0;
+    for (let t = 0; t < teams; t++) {
+      for (let i = 0; i < size; i++) {
+        if (i < leaders) continue; // leaders stay client-side
+        const sp = BOT_SPAWNS[n % BOT_SPAWNS.length];
+        this.bots.push({
+          id: `b${t}_${i}`,
+          team: t,
+          name: `B${t}-${i}`,
+          x: sp.x + (Math.random() - 0.5) * 8,
+          y: sp.y,
+          z: sp.z + (Math.random() - 0.5) * 8,
+          yaw: Math.random() * Math.PI * 2,
+          hp: 100,
+          alive: true,
+          destX: sp.x,
+          destZ: sp.z,
+          order: null,
+          fireCd: 0,
+          respawnAt: 0,
+          deathX: sp.x,
+          deathZ: sp.z,
+        });
+        n++;
+      }
+    }
+  }
+
+  farSpawn(fromX, fromZ, avoidX, avoidZ) {
+    let best = BOT_SPAWNS[0], bestScore = -1;
+    for (const s of BOT_SPAWNS) {
+      const d1 = Math.hypot(s.x - fromX, s.z - fromZ);
+      const d2 = Math.hypot(s.x - avoidX, s.z - avoidZ);
+      const score = d1 + d2;
+      if (score > bestScore) { bestScore = score; best = s; }
+    }
+    return best;
+  }
+
+  tickBots() {
+    if (!this.cfg?.botArena || !this.bots.length) return;
+    const now = Date.now();
+    const dt = 0.2;
+    // nearest living player as target
+    let player = null;
+    for (const s of this.sessions.values()) {
+      if (s.alive) { player = s; break; }
+    }
+    for (const b of this.bots) {
+      if (!b.alive) {
+        if (b.respawnAt && now >= b.respawnAt) {
+          const sp = this.farSpawn(player ? player.x : 0, player ? player.z : 0, b.deathX, b.deathZ);
+          b.x = sp.x + (Math.random() - 0.5) * 10;
+          b.z = sp.z + (Math.random() - 0.5) * 10;
+          b.y = sp.y;
+          b.hp = 100;
+          b.alive = true;
+          b.order = null;
+          b.destX = b.x;
+          b.destZ = b.z;
+        }
+        continue;
+      }
+      b.fireCd = Math.max(0, b.fireCd - dt);
+      const ox = b.order;
+      let tx = b.destX, tz = b.destZ, spd = 2.8;
+      if (ox) {
+        if (ox.type === 'hold') { tx = ox.x; tz = ox.z; spd = Math.hypot(b.x - tx, b.z - tz) > 2 ? 2.2 : 0; }
+        else { tx = ox.x; tz = ox.z; spd = 5.0; }
+      } else if (player) {
+        // idle drift toward map, not player
+        if (Math.hypot(b.x - b.destX, b.z - b.destZ) < 3) {
+          const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
+          b.destX = sp.x; b.destZ = sp.z;
+        }
+        tx = b.destX; tz = b.destZ; spd = 3.2;
+      }
+      const dx = tx - b.x, dz = tz - b.z, dist = Math.hypot(dx, dz);
+      if (spd > 0 && dist > 0.5) {
+        const step = Math.min(dist, spd * dt);
+        b.x += (dx / dist) * step;
+        b.z += (dz / dist) * step;
+        b.yaw = Math.atan2(-dx, -dz);
+      }
+      // shoot player if close and ordered to attack player or nearby
+      if (player && b.fireCd <= 0) {
+        const pd = Math.hypot(player.x - b.x, player.z - b.z);
+        const attackPlayer = ox && (ox.targetId === 'player' || ox.type === 'attack') && pd < 55;
+        const opportunistic = !ox && pd < 28;
+        if ((attackPlayer || opportunistic) && pd > 2) {
+          b.yaw = Math.atan2(-(player.x - b.x), -(player.z - b.z));
+          b.fireCd = 0.35 + Math.random() * 0.25;
+          const dmg = 8 + Math.floor(Math.random() * 6);
+          // simple hit chance falls with distance
+          if (Math.random() < Math.max(0.15, 0.75 - pd / 100)) {
+            player.hp = Math.max(0, player.hp - dmg);
+            this.send(player.ws, { type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger' });
+            if (player.hp <= 0) {
+              player.alive = false;
+              player.d++;
+              this.broadcast({ type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false });
+              player.respawnAt = now + 3000;
+            }
+          }
+          this.broadcast({
+            type: 'bot_shoot',
+            id: b.id,
+            x: b.x, y: b.y + 1.4, z: b.z,
+            dx: player.x - b.x, dy: 0, dz: player.z - b.z,
+          });
+        }
+      }
+    }
+    // snapshot ~5 Hz already on 200ms tick
+    this.broadcast({
+      type: 'bots',
+      list: this.bots.map((b) => ({
+        id: b.id, team: b.team, name: b.name,
+        x: b.x, y: b.y, z: b.z, yaw: b.yaw,
+        hp: b.hp, alive: b.alive,
+      })),
+    });
+  }
+
+  applyBotOrder(msg) {
+    if (!this.cfg?.botArena) return;
+    const team = msg.team | 0;
+    const order = msg.order;
+    if (!order || typeof order !== 'object') return;
+    for (const b of this.bots) {
+      if (b.team !== team || !b.alive) continue;
+      b.order = {
+        type: order.type || 'move',
+        x: +order.x || b.x,
+        z: +order.z || b.z,
+        targetId: order.targetId || null,
+      };
+      b.destX = b.order.x;
+      b.destZ = b.order.z;
+    }
+  }
+
+  hitBot(msg, attacker) {
+    if (!this.cfg?.botArena) return;
+    const b = this.bots.find((x) => x.id === msg.id);
+    if (!b || !b.alive) return;
+    const dmg = Math.min(80, Math.max(1, +msg.dmg || 10));
+    b.hp -= dmg;
+    if (b.hp <= 0) {
+      b.hp = 0;
+      b.alive = false;
+      b.deathX = b.x;
+      b.deathZ = b.z;
+      b.respawnAt = Date.now() + 14000 + Math.floor(Math.random() * 8000);
+      if (attacker) {
+        attacker.k++;
+        this.broadcast({ type: 'kill', killer: attacker.id, kname: attacker.name, victim: b.id, vname: b.name, head: !!msg.head });
+        this.broadcastScores();
+      }
+    }
+  }
+
   send(ws, obj) {
     try { ws.send(JSON.stringify(obj)); } catch (_) {}
   }
