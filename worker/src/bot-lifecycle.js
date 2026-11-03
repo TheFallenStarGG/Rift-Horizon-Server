@@ -58,6 +58,20 @@ GameRoom.prototype.reactBotLeaderHit = function (team, x, z) {
   }
 };
 
+// Accept both the dedicated event and the order-wrapped client protocol.
+const onMessage = GameRoom.prototype.onMessage;
+GameRoom.prototype.onMessage = function (session, msg) {
+  if (msg?.type === 'bot_leader_hit') {
+    this.reactBotLeaderHit(
+      msg.team | 0,
+      Number(msg.x) || 0,
+      Number(msg.z) || 0,
+    );
+    return;
+  }
+  return onMessage.call(this, session, msg);
+};
+
 const applyBotOrder = GameRoom.prototype.applyBotOrder;
 GameRoom.prototype.applyBotOrder = function (msg) {
   const order = msg?.order;
