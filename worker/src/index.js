@@ -92,20 +92,23 @@ export default {
         }
 
         const chain = [];
-        if (prefer === 'gofile') chain.push(['gofile', tryGofile]);
+        // Discord needs a direct media URL that stays online.
+        // Rank: catbox > 0x0 > tmpfiles > litterbox (flaky loads / weak embed) > gofile > file.io
+        if (prefer === 'catbox') chain.push(['catbox', () => tryCatbox(false)]);
         else if (prefer === '0x0') chain.push(['0x0', try0x0]);
         else if (prefer === 'tmpfiles') chain.push(['tmpfiles', tryTmpfiles]);
-        else if (prefer === 'fileio' || prefer === 'file.io') chain.push(['file.io', tryFileIo]);
         else if (prefer === 'litterbox') chain.push(['litterbox', () => tryCatbox(true)]);
-        else if (prefer === 'catbox') chain.push(['catbox', () => tryCatbox(false)]);
+        else if (prefer === 'gofile') chain.push(['gofile', tryGofile]);
+        else if (prefer === 'fileio' || prefer === 'file.io') chain.push(['file.io', tryFileIo]);
         else {
+          const big = body.byteLength > 200 * 1024 * 1024;
+          if (!big) chain.push(['catbox', () => tryCatbox(false)]);
           chain.push(
-            ['gofile', tryGofile],
             ['0x0', try0x0],
             ['tmpfiles', tryTmpfiles],
-            ['file.io', tryFileIo],
-            ['catbox', () => tryCatbox(false)],
             ['litterbox', () => tryCatbox(true)],
+            ['gofile', tryGofile],
+            ['file.io', tryFileIo],
           );
         }
 
