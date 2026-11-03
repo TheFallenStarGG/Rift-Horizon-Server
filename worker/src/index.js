@@ -483,6 +483,8 @@ handleSession(ws, name, params) {
       }
       case 'bot_order': this.applyBotOrder(msg); break;
       case 'bot_hit': this.hitBot(msg, s); break;
+      case 'bot_team_wipe': this.wipeBotTeam(msg.team | 0); break;
+      case 'bot_leader_spawn': this.spawnBotTeam(msg.team | 0, +msg.x || 0, +msg.z || 0); break;
       case 'respawn': break; // the server respawns players itself
       case 'chat': {
         const text = String(msg.text || '').trim().slice(0, 200);
