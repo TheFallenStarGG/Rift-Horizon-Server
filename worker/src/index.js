@@ -178,7 +178,7 @@ const SLOTS = ['main', 'side', 'melee'];
 const DEFAULT_LO = ['vanguard', 'p9', 'knife'];
 
 const MODES = {
-  bots: { cap: 4, min: 1, teams: false, rounds: false, target: 0, respawn: 0, botArena: true },
+  bots: { cap: 4, min: 1, teams: false, rounds: false, target: 999999, respawn: 3500, botArena: true },
   ffa: { cap: 8, min: 1, teams: false, rounds: false, target: 20, respawn: 3000 },
   custom: { cap: 12, min: 1, teams: false, rounds: false, target: 30, respawn: 3000 },
   duel: { cap: 2, min: 2, teams: true, rounds: true, win: 3, respawn: 0 },
@@ -234,10 +234,11 @@ function cleanSpec(sp) {
 const specKey = (s) => `${s.type}:${s.ix}:${s.iz}:${s.lv}:${s.o}`;
 
 const BOT_SPAWNS = [
-  { x: 80, y: 2, z: 80 }, { x: -80, y: 2, z: 80 }, { x: 80, y: 2, z: -80 }, { x: -80, y: 2, z: -80 },
-  { x: 120, y: 2, z: 0 }, { x: -120, y: 2, z: 0 }, { x: 0, y: 2, z: 120 }, { x: 0, y: 2, z: -120 },
-  { x: 200, y: 2, z: 40 }, { x: -200, y: 2, z: -40 }, { x: 40, y: 2, z: 200 }, { x: -40, y: 2, z: -200 },
-  { x: 150, y: 2, z: 150 }, { x: -150, y: 2, z: 150 }, { x: 150, y: 2, z: -150 }, { x: -150, y: 2, z: -150 },
+  { x: 320, y: 0, z: 280 }, { x: -340, y: 0, z: 260 }, { x: 300, y: 0, z: -310 }, { x: -290, y: 0, z: -330 },
+  { x: 420, y: 0, z: 40 }, { x: -410, y: 0, z: -60 }, { x: 50, y: 0, z: 430 }, { x: -70, y: 0, z: -440 },
+  { x: 380, y: 0, z: 180 }, { x: -360, y: 0, z: 200 }, { x: 200, y: 0, z: -390 }, { x: -220, y: 0, z: -370 },
+  { x: 480, y: 0, z: -120 }, { x: -470, y: 0, z: 140 }, { x: 140, y: 0, z: 490 }, { x: -160, y: 0, z: -480 },
+  { x: 250, y: 0, z: 400 }, { x: -270, y: 0, z: -410 }, { x: 400, y: 0, z: -280 }, { x: -390, y: 0, z: 300 },
 ];
 
 export class GameRoom {
@@ -563,10 +564,11 @@ handleSession(ws, name, params) {
   checkEnd() {
     if (this.phase !== 'live') return;
     const cfg = this.cfg;
+    if (cfg.botArena) return;
     if (!cfg.rounds) {
       let top = null;
       for (const s of this.sessions.values()) if (!top || s.k > top.k) top = s;
-      if (top && top.k >= cfg.target) this.setPhase('ended', 9, { winner: top.name });
+      if (cfg.target > 0 && top && top.k >= cfg.target) this.setPhase('ended', 9, { winner: top.name });
       return;
     }
     const alive = { A: 0, B: 0 }, total = { A: 0, B: 0 };
@@ -590,8 +592,14 @@ handleSession(ws, name, params) {
   tick() {
     const cfg = this.cfg;
     if (!cfg || cfg.social) return;
-    if (cfg.botArena) this.tickBots();
     const now = Date.now(), n = this.sessions.size;
+    if (cfg.botArena) {
+      this.tickBots();
+      for (const s of this.sessions.values()) {
+        if (!s.alive && s.respawnAt && now >= s.respawnAt) this.placePlayer(s, true, 1500);
+      }
+      return;
+    }
     if (!cfg.rounds && this.phase === 'live') {
       for (const s of this.sessions.values()) if (!s.alive && s.respawnAt && now >= s.respawnAt) this.placePlayer(s, true, 2000);
     }
@@ -710,16 +718,17 @@ handleSession(ws, name, params) {
     for (const b of this.bots) {
       if (!b.alive) {
         if (b.respawnAt && now >= b.respawnAt) {
-          const sp = this.farSpawn(player ? player.x : 0, player ? player.z : 0, b.deathX, b.deathZ);
-          b.x = sp.x + (Math.random() - 0.5) * 10;
-          b.z = sp.z + (Math.random() - 0.5) * 10;
-          b.y = sp.y;
+          const sp = this.farSpawn(player ? player.x : 0, player ? player.z : 0, b.deathX || 0, b.deathZ || 0);
+          b.x = sp.x + (Math.random() - 0.5) * 24;
+          b.z = sp.z + (Math.random() - 0.5) * 24;
+          // y ignored by client — client snaps to floorAt
+          b.y = 0;
           b.hp = 100;
           b.alive = true;
           b.order = null;
-          b.destX = b.x;
-          b.destZ = b.z;
-          b.ammo = b.mag;
+          b.destX = b.x + (Math.random() - 0.5) * 40;
+          b.destZ = b.z + (Math.random() - 0.5) * 40;
+          b.ammo = b.mag || 30;
           b.reloading = false;
           b.state = 'patrol';
           b.ads = false;
@@ -729,146 +738,119 @@ handleSession(ws, name, params) {
         continue;
       }
 
-      b.fireCd = Math.max(0, b.fireCd - dt);
+      b.fireCd = Math.max(0, (b.fireCd || 0) - dt);
       const pd = player ? Math.hypot(player.x - b.x, player.z - b.z) : 999;
       const ox = b.order;
 
-      // reload
       if (b.reloading) {
         if (now >= b.reloadAt) {
-          b.ammo = b.mag;
+          b.ammo = b.mag || 30;
           b.reloading = false;
-          b.state = 'engage';
+          b.state = 'patrol';
         }
-      } else if (b.ammo <= 0) {
+      } else if ((b.ammo ?? 30) <= 0) {
         b.reloading = true;
-        b.reloadAt = now + 1800 + Math.floor(Math.random() * 600);
+        b.reloadAt = now + 2000 + Math.floor(Math.random() * 800);
         b.ads = false;
         b.state = 'reload';
-        // step back slightly while reloading
-        if (player && pd < 40) {
+        if (player && pd < 50) {
           const ang = Math.atan2(b.x - player.x, b.z - player.z);
-          b.destX = b.x + Math.sin(ang) * 8;
-          b.destZ = b.z + Math.cos(ang) * 8;
+          b.destX = b.x + Math.sin(ang) * 12;
+          b.destZ = b.z + Math.cos(ang) * 12;
         }
       }
 
-      // free will: sometimes break off order briefly
-      if (now > (b.freeWillUntil || 0) && Math.random() < 0.04) {
-        b.freeWillUntil = now + 2000 + Math.floor(Math.random() * 2500);
-        b.strafeDir *= -1;
-        if (player && pd < 50 && Math.random() < 0.55) {
-          b.state = 'cover';
-          const ang = Math.atan2(b.x - player.x, b.z - player.z) + b.strafeDir * 1.1;
-          b.coverX = b.x + Math.sin(ang) * (10 + Math.random() * 12);
-          b.coverZ = b.z + Math.cos(ang) * (10 + Math.random() * 12);
-          b.destX = b.coverX;
-          b.destZ = b.coverZ;
-        } else {
-          b.state = 'patrol';
-          const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
-          b.destX = sp.x + (Math.random() - 0.5) * 20;
-          b.destZ = sp.z + (Math.random() - 0.5) * 20;
-        }
+      if (now > (b.freeWillUntil || 0) && Math.random() < 0.03) {
+        b.freeWillUntil = now + 3000 + Math.floor(Math.random() * 4000);
+        b.strafeDir = Math.random() < 0.5 ? 1 : -1;
+        const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
+        b.destX = sp.x + (Math.random() - 0.5) * 40;
+        b.destZ = sp.z + (Math.random() - 0.5) * 40;
+        b.state = 'patrol';
       }
 
-      // choose move target
-      let tx = b.destX, tz = b.destZ, spd = 3.2;
+      let tx = b.destX, tz = b.destZ, spd = 3.0;
       const free = now < (b.freeWillUntil || 0);
 
       if (b.reloading) {
-        tx = b.destX; tz = b.destZ; spd = 2.4;
-      } else if (free && b.state === 'cover') {
-        tx = b.coverX; tz = b.coverZ; spd = 4.2;
-      } else if (ox && !free) {
-        if (ox.type === 'hold') {
-          tx = ox.x; tz = ox.z;
-          spd = Math.hypot(b.x - tx, b.z - tz) > 2.5 ? 2.5 : 0;
-        } else if (ox.type === 'attack' && player) {
-          // approach but strafe, not straight line
-          const ang = Math.atan2(player.x - b.x, player.z - b.z);
-          const side = b.strafeDir * (8 + (b.id.charCodeAt(b.id.length - 1) % 5));
-          tx = player.x + Math.cos(ang) * side - Math.sin(ang) * 18;
-          tz = player.z - Math.sin(ang) * side - Math.cos(ang) * 18;
-          spd = pd > 35 ? 5.2 : pd > 18 ? 3.6 : 2.2;
-          b.state = 'engage';
-        } else {
-          tx = ox.x; tz = ox.z; spd = 4.6;
-        }
-      } else if (player && pd < 45) {
-        // engage on own: orbit / pressure
+        tx = b.destX; tz = b.destZ; spd = 2.2;
+      } else if (ox && !free && (ox.type === 'attack' || ox.targetId === 'player') && player && pd < 55) {
         const ang = Math.atan2(player.x - b.x, player.z - b.z);
-        tx = player.x + Math.cos(ang) * b.strafeDir * 12 - Math.sin(ang) * 16;
-        tz = player.z - Math.sin(ang) * b.strafeDir * 12 - Math.cos(ang) * 16;
-        spd = 3.8;
+        const side = (b.strafeDir || 1) * (10 + Math.random() * 8);
+        tx = player.x + Math.cos(ang) * side - Math.sin(ang) * 22;
+        tz = player.z - Math.sin(ang) * side - Math.cos(ang) * 22;
+        spd = pd > 30 ? 4.2 : 2.8;
+        b.state = 'engage';
+      } else if (ox && !free && ox.type === 'hold') {
+        tx = ox.x; tz = ox.z;
+        spd = Math.hypot(b.x - tx, b.z - tz) > 3 ? 2.4 : 0;
+      } else if (ox && !free && ox.type === 'move') {
+        tx = ox.x; tz = ox.z; spd = 4.0;
+      } else if (player && pd < 28) {
+        const ang = Math.atan2(player.x - b.x, player.z - b.z);
+        tx = player.x + Math.cos(ang) * (b.strafeDir || 1) * 14 - Math.sin(ang) * 16;
+        tz = player.z - Math.sin(ang) * (b.strafeDir || 1) * 14 - Math.cos(ang) * 16;
+        spd = 3.4;
         b.state = 'engage';
       } else {
-        if (Math.hypot(b.x - b.destX, b.z - b.destZ) < 3) {
+        if (Math.hypot(b.x - (b.destX || b.x), b.z - (b.destZ || b.z)) < 4) {
           const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
-          b.destX = sp.x + (Math.random() - 0.5) * 30;
-          b.destZ = sp.z + (Math.random() - 0.5) * 30;
+          b.destX = sp.x + (Math.random() - 0.5) * 50;
+          b.destZ = sp.z + (Math.random() - 0.5) * 50;
         }
-        tx = b.destX; tz = b.destZ; spd = 3.0;
+        tx = b.destX; tz = b.destZ; spd = 2.8;
         b.state = 'patrol';
       }
 
       const dx = tx - b.x, dz = tz - b.z, dist = Math.hypot(dx, dz);
-      if (spd > 0 && dist > 0.6) {
+      if (spd > 0 && dist > 0.7) {
         const step = Math.min(dist, spd * dt);
         b.x += (dx / dist) * step;
         b.z += (dz / dist) * step;
         b.moving = true;
-        // face movement unless about to shoot
-        if (!(player && pd < 50 && !b.reloading && b.ammo > 0)) {
+        if (!(player && pd < 35 && !b.reloading && (b.ammo ?? 1) > 0 && b.state === 'engage')) {
           b.yaw = Math.atan2(-dx, -dz);
         }
       } else {
         b.moving = false;
       }
 
-      // aim + shoot — always face the target when firing
       b.ads = false;
-      if (player && !b.reloading && b.ammo > 0 && b.fireCd <= 0 && pd > 3 && pd < 58) {
-        const shouldShoot =
-          (ox && (ox.targetId === 'player' || ox.type === 'attack') && pd < 55) ||
-          (b.state === 'engage' && pd < 42) ||
-          (pd < 25 && Math.random() < 0.35);
+      if (
+        player && !b.reloading && (b.ammo ?? 0) > 0 && b.fireCd <= 0 &&
+        pd > 4 && pd < 32 && b.state === 'engage'
+      ) {
+        b.yaw = Math.atan2(-(player.x - b.x), -(player.z - b.z));
+        b.ads = pd > 14;
+        b.fireCd = 0.45 + Math.random() * 0.35;
+        b.ammo = Math.max(0, (b.ammo ?? 30) - 1);
 
-        if (shouldShoot) {
-          // look at player
-          b.yaw = Math.atan2(-(player.x - b.x), -(player.z - b.z));
-          b.ads = pd > 12;
-          b.fireCd = 0.28 + Math.random() * 0.22;
-          b.ammo = Math.max(0, b.ammo - 1);
+        const spread = 0.08 + pd * 0.004 + (b.moving ? 0.06 : 0);
+        const dxp = player.x - b.x + (Math.random() - 0.5) * spread * pd;
+        const dzp = player.z - b.z + (Math.random() - 0.5) * spread * pd;
+        const dyp = 1.0 + (Math.random() - 0.5) * 0.6;
 
-          const aimJitter = 0.04 + pd * 0.0015;
-          const dxp = player.x - b.x + (Math.random() - 0.5) * aimJitter * pd;
-          const dzp = player.z - b.z + (Math.random() - 0.5) * aimJitter * pd;
-          const dyp = (player.y || 0) + 1.2 - (b.y + 1.4);
+        this.broadcast({
+          type: 'bot_shoot',
+          id: b.id,
+          x: b.x, y: 0, z: b.z,
+          dx: dxp, dy: dyp, dz: dzp,
+        });
 
-          this.broadcast({
-            type: 'bot_shoot',
-            id: b.id,
-            x: b.x, y: b.y + 1.4, z: b.z,
-            dx: dxp, dy: dyp, dz: dzp,
+        const hitChance = Math.max(0.05, 0.28 - pd / 120 - (b.moving ? 0.08 : 0));
+        if (Math.random() < hitChance) {
+          const dmg = 5 + Math.floor(Math.random() * 5);
+          player.hp = Math.max(0, player.hp - dmg);
+          this.send(player.ws, {
+            type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger',
           });
-
-          // hit chance drops with range + movement
-          const hitChance = Math.max(0.12, 0.72 - pd / 90 - (b.moving ? 0.12 : 0));
-          if (Math.random() < hitChance) {
-            const dmg = 7 + Math.floor(Math.random() * 7);
-            player.hp = Math.max(0, player.hp - dmg);
-            this.send(player.ws, {
-              type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger',
+          if (player.hp <= 0) {
+            player.alive = false;
+            player.d++;
+            this.broadcast({
+              type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false,
             });
-            if (player.hp <= 0) {
-              player.alive = false;
-              player.d++;
-              this.broadcast({
-                type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false,
-              });
-              player.respawnAt = now + 3000;
-            }
+            player.respawnAt = now + 3500;
           }
         }
       }
@@ -878,10 +860,10 @@ handleSession(ws, name, params) {
       type: 'bots',
       list: this.bots.map((b) => ({
         id: b.id, team: b.team, name: b.name,
-        x: b.x, y: b.y, z: b.z, yaw: b.yaw,
+        x: b.x, z: b.z, yaw: b.yaw,
         hp: b.hp, alive: b.alive,
         moving: !!b.moving, ads: !!b.ads, reloading: !!b.reloading,
-        ammo: b.ammo, state: b.state,
+        ammo: b.ammo ?? 30, state: b.state || 'patrol',
       })),
     });
   }
