@@ -669,6 +669,18 @@ handleSession(ws, name, params) {
           respawnAt: 0,
           deathX: sp.x,
           deathZ: sp.z,
+          ammo: 30,
+          mag: 30,
+          reloading: false,
+          reloadAt: 0,
+          state: 'patrol',
+          stateUntil: 0,
+          strafeDir: Math.random() < 0.5 ? 1 : -1,
+          coverX: sp.x,
+          coverZ: sp.z,
+          ads: false,
+          moving: false,
+          freeWillUntil: 0,
         });
         n++;
       }
@@ -690,11 +702,11 @@ handleSession(ws, name, params) {
     if (!this.cfg?.botArena || !this.bots.length) return;
     const now = Date.now();
     const dt = 0.2;
-    // nearest living player as target
     let player = null;
     for (const s of this.sessions.values()) {
       if (s.alive) { player = s; break; }
     }
+
     for (const b of this.bots) {
       if (!b.alive) {
         if (b.respawnAt && now >= b.respawnAt) {
@@ -707,66 +719,169 @@ handleSession(ws, name, params) {
           b.order = null;
           b.destX = b.x;
           b.destZ = b.z;
+          b.ammo = b.mag;
+          b.reloading = false;
+          b.state = 'patrol';
+          b.ads = false;
+          b.moving = false;
+          b.freeWillUntil = 0;
         }
         continue;
       }
+
       b.fireCd = Math.max(0, b.fireCd - dt);
+      const pd = player ? Math.hypot(player.x - b.x, player.z - b.z) : 999;
       const ox = b.order;
-      let tx = b.destX, tz = b.destZ, spd = 2.8;
-      if (ox) {
-        if (ox.type === 'hold') { tx = ox.x; tz = ox.z; spd = Math.hypot(b.x - tx, b.z - tz) > 2 ? 2.2 : 0; }
-        else { tx = ox.x; tz = ox.z; spd = 5.0; }
-      } else if (player) {
-        // idle drift toward map, not player
+
+      // reload
+      if (b.reloading) {
+        if (now >= b.reloadAt) {
+          b.ammo = b.mag;
+          b.reloading = false;
+          b.state = 'engage';
+        }
+      } else if (b.ammo <= 0) {
+        b.reloading = true;
+        b.reloadAt = now + 1800 + Math.floor(Math.random() * 600);
+        b.ads = false;
+        b.state = 'reload';
+        // step back slightly while reloading
+        if (player && pd < 40) {
+          const ang = Math.atan2(b.x - player.x, b.z - player.z);
+          b.destX = b.x + Math.sin(ang) * 8;
+          b.destZ = b.z + Math.cos(ang) * 8;
+        }
+      }
+
+      // free will: sometimes break off order briefly
+      if (now > (b.freeWillUntil || 0) && Math.random() < 0.04) {
+        b.freeWillUntil = now + 2000 + Math.floor(Math.random() * 2500);
+        b.strafeDir *= -1;
+        if (player && pd < 50 && Math.random() < 0.55) {
+          b.state = 'cover';
+          const ang = Math.atan2(b.x - player.x, b.z - player.z) + b.strafeDir * 1.1;
+          b.coverX = b.x + Math.sin(ang) * (10 + Math.random() * 12);
+          b.coverZ = b.z + Math.cos(ang) * (10 + Math.random() * 12);
+          b.destX = b.coverX;
+          b.destZ = b.coverZ;
+        } else {
+          b.state = 'patrol';
+          const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
+          b.destX = sp.x + (Math.random() - 0.5) * 20;
+          b.destZ = sp.z + (Math.random() - 0.5) * 20;
+        }
+      }
+
+      // choose move target
+      let tx = b.destX, tz = b.destZ, spd = 3.2;
+      const free = now < (b.freeWillUntil || 0);
+
+      if (b.reloading) {
+        tx = b.destX; tz = b.destZ; spd = 2.4;
+      } else if (free && b.state === 'cover') {
+        tx = b.coverX; tz = b.coverZ; spd = 4.2;
+      } else if (ox && !free) {
+        if (ox.type === 'hold') {
+          tx = ox.x; tz = ox.z;
+          spd = Math.hypot(b.x - tx, b.z - tz) > 2.5 ? 2.5 : 0;
+        } else if (ox.type === 'attack' && player) {
+          // approach but strafe, not straight line
+          const ang = Math.atan2(player.x - b.x, player.z - b.z);
+          const side = b.strafeDir * (8 + (b.id.charCodeAt(b.id.length - 1) % 5));
+          tx = player.x + Math.cos(ang) * side - Math.sin(ang) * 18;
+          tz = player.z - Math.sin(ang) * side - Math.cos(ang) * 18;
+          spd = pd > 35 ? 5.2 : pd > 18 ? 3.6 : 2.2;
+          b.state = 'engage';
+        } else {
+          tx = ox.x; tz = ox.z; spd = 4.6;
+        }
+      } else if (player && pd < 45) {
+        // engage on own: orbit / pressure
+        const ang = Math.atan2(player.x - b.x, player.z - b.z);
+        tx = player.x + Math.cos(ang) * b.strafeDir * 12 - Math.sin(ang) * 16;
+        tz = player.z - Math.sin(ang) * b.strafeDir * 12 - Math.cos(ang) * 16;
+        spd = 3.8;
+        b.state = 'engage';
+      } else {
         if (Math.hypot(b.x - b.destX, b.z - b.destZ) < 3) {
           const sp = BOT_SPAWNS[Math.floor(Math.random() * BOT_SPAWNS.length)];
-          b.destX = sp.x; b.destZ = sp.z;
+          b.destX = sp.x + (Math.random() - 0.5) * 30;
+          b.destZ = sp.z + (Math.random() - 0.5) * 30;
         }
-        tx = b.destX; tz = b.destZ; spd = 3.2;
+        tx = b.destX; tz = b.destZ; spd = 3.0;
+        b.state = 'patrol';
       }
+
       const dx = tx - b.x, dz = tz - b.z, dist = Math.hypot(dx, dz);
-      if (spd > 0 && dist > 0.5) {
+      if (spd > 0 && dist > 0.6) {
         const step = Math.min(dist, spd * dt);
         b.x += (dx / dist) * step;
         b.z += (dz / dist) * step;
-        b.yaw = Math.atan2(-dx, -dz);
+        b.moving = true;
+        // face movement unless about to shoot
+        if (!(player && pd < 50 && !b.reloading && b.ammo > 0)) {
+          b.yaw = Math.atan2(-dx, -dz);
+        }
+      } else {
+        b.moving = false;
       }
-      // shoot player if close and ordered to attack player or nearby
-      if (player && b.fireCd <= 0) {
-        const pd = Math.hypot(player.x - b.x, player.z - b.z);
-        const attackPlayer = ox && (ox.targetId === 'player' || ox.type === 'attack') && pd < 55;
-        const opportunistic = !ox && pd < 28;
-        if ((attackPlayer || opportunistic) && pd > 2) {
+
+      // aim + shoot — always face the target when firing
+      b.ads = false;
+      if (player && !b.reloading && b.ammo > 0 && b.fireCd <= 0 && pd > 3 && pd < 58) {
+        const shouldShoot =
+          (ox && (ox.targetId === 'player' || ox.type === 'attack') && pd < 55) ||
+          (b.state === 'engage' && pd < 42) ||
+          (pd < 25 && Math.random() < 0.35);
+
+        if (shouldShoot) {
+          // look at player
           b.yaw = Math.atan2(-(player.x - b.x), -(player.z - b.z));
-          b.fireCd = 0.35 + Math.random() * 0.25;
-          const dmg = 8 + Math.floor(Math.random() * 6);
-          // simple hit chance falls with distance
-          if (Math.random() < Math.max(0.15, 0.75 - pd / 100)) {
-            player.hp = Math.max(0, player.hp - dmg);
-            this.send(player.ws, { type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger' });
-            if (player.hp <= 0) {
-              player.alive = false;
-              player.d++;
-              this.broadcast({ type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false });
-              player.respawnAt = now + 3000;
-            }
-          }
+          b.ads = pd > 12;
+          b.fireCd = 0.28 + Math.random() * 0.22;
+          b.ammo = Math.max(0, b.ammo - 1);
+
+          const aimJitter = 0.04 + pd * 0.0015;
+          const dxp = player.x - b.x + (Math.random() - 0.5) * aimJitter * pd;
+          const dzp = player.z - b.z + (Math.random() - 0.5) * aimJitter * pd;
+          const dyp = (player.y || 0) + 1.2 - (b.y + 1.4);
+
           this.broadcast({
             type: 'bot_shoot',
             id: b.id,
             x: b.x, y: b.y + 1.4, z: b.z,
-            dx: player.x - b.x, dy: 0, dz: player.z - b.z,
+            dx: dxp, dy: dyp, dz: dzp,
           });
+
+          // hit chance drops with range + movement
+          const hitChance = Math.max(0.12, 0.72 - pd / 90 - (b.moving ? 0.12 : 0));
+          if (Math.random() < hitChance) {
+            const dmg = 7 + Math.floor(Math.random() * 7);
+            player.hp = Math.max(0, player.hp - dmg);
+            this.send(player.ws, {
+              type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger',
+            });
+            if (player.hp <= 0) {
+              player.alive = false;
+              player.d++;
+              this.broadcast({
+                type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false,
+              });
+              player.respawnAt = now + 3000;
+            }
+          }
         }
       }
     }
-    // snapshot ~5 Hz already on 200ms tick
+
     this.broadcast({
       type: 'bots',
       list: this.bots.map((b) => ({
         id: b.id, team: b.team, name: b.name,
         x: b.x, y: b.y, z: b.z, yaw: b.yaw,
         hp: b.hp, alive: b.alive,
+        moving: !!b.moving, ads: !!b.ads, reloading: !!b.reloading,
+        ammo: b.ammo, state: b.state,
       })),
     });
   }
