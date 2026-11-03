@@ -236,7 +236,7 @@ function cleanSpec(sp) {
 }
 const specKey = (s) => `${s.type}:${s.ix}:${s.iz}:${s.lv}:${s.o}`;
 
-const BOT_SPAWNS = [
+export const BOT_SPAWNS = [
   { x: 320, y: 0, z: 280 }, { x: -340, y: 0, z: 260 }, { x: 300, y: 0, z: -310 }, { x: -290, y: 0, z: -330 },
   { x: 420, y: 0, z: 40 }, { x: -410, y: 0, z: -60 }, { x: 50, y: 0, z: 430 }, { x: -70, y: 0, z: -440 },
   { x: 380, y: 0, z: 180 }, { x: -360, y: 0, z: 200 }, { x: 200, y: 0, z: -390 }, { x: -220, y: 0, z: -370 },
