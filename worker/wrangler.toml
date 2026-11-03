@@ -1,5 +1,5 @@
 name = "fps-game-server"
-main = "src/index.js"
+main = "src/bot-lifecycle.js"
 compatibility_date = "2024-11-01"
 
 [[durable_objects.bindings]]
