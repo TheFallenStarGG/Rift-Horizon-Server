@@ -897,6 +897,14 @@ handleSession(ws, name, params) {
     if (!b || !b.alive) return;
     const dmg = Math.min(80, Math.max(1, +msg.dmg || 10));
     b.hp -= dmg;
+    // React: face the player and fight back
+    if (attacker && attacker.alive) {
+      b.order = { type: 'attack', x: attacker.x, z: attacker.z, targetId: 'player', t: Date.now() };
+      b.state = 'engage';
+      b.destX = attacker.x;
+      b.destZ = attacker.z;
+      b.freeWillUntil = 0;
+    }
     if (b.hp <= 0) {
       b.hp = 0;
       b.alive = false;
