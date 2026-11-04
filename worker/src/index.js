@@ -31,7 +31,7 @@ export default {
           const server = srv?.data?.servers?.[0]?.name;
           if (!server) throw new Error('no gofile server');
           const form = new FormData();
-          form.append('file', blob, name);
+          form.append('file', new File([buf], name, { type }));
           const up = await fetch(`https://${server}.gofile.io/uploadFile`, { method: 'POST', body: form });
           const j = await up.json();
           const page = j?.data?.downloadPage || j?.data?.directLink;
@@ -72,7 +72,8 @@ export default {
         async function tryCatbox(litter) {
           const form = new FormData();
           form.append('reqtype', 'fileupload');
-          form.append('fileToUpload', blob, name);
+          const file = new File([buf], name, { type });
+          form.append('fileToUpload', file);
           let endpoint;
           if (litter) {
             form.append('time', '72h');
@@ -97,7 +98,7 @@ export default {
         else if (prefer === 'litterbox') chain.push(['litterbox', () => tryCatbox(true)]);
         else if (prefer === '0x0') chain.push(['0x0', try0x0]);
         else {
-          const big = body.byteLength > 200 * 1024 * 1024;
+          const big = buf.byteLength > 200 * 1024 * 1024;
           if (!big) chain.push(['catbox', () => tryCatbox(false)]);
           chain.push(
             ['litterbox', () => tryCatbox(true)],
