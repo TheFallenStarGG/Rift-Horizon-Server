@@ -15,94 +15,78 @@ export default {
     if (url.pathname === '/api/rec' && request.method === 'PUT') {
       try {
         let name = (url.searchParams.get('name') || '').replace(/[^a-zA-Z0-9._-]/g, '');
-        if (!name || name.length > 80) name = `rec-${Date.now()}.mp4`;
-        if (!/\.(mp4|webm)$/i.test(name)) name += '.mp4';
+        if (!name || name.length > 80) name = `rec-${Date.now()}.webm`;
+        if (!/\.(mp4|webm)$/i.test(name)) name += '.webm';
         const buf = await request.arrayBuffer();
         if (!buf.byteLength) return json({ error: 'empty body' }, 400);
         if (buf.byteLength > 1024 * 1024 * 1024) return json({ error: 'file too large (max 1GB)' }, 413);
         const prefer = (url.searchParams.get('host') || 'auto').toLowerCase();
         const type = request.headers.get('Content-Type') || (name.endsWith('.webm') ? 'video/webm' : 'video/mp4');
-        const blob = new Blob([buf], { type });
+        const file = new File([buf], name, { type });
         const errors = [];
 
-        async function tryGofile() {
-          const srvRes = await fetch('https://api.gofile.io/servers');
-          const srv = await srvRes.json();
-          const server = srv?.data?.servers?.[0]?.name;
-          if (!server) throw new Error('no gofile server');
-          const form = new FormData();
-          form.append('file', new File([buf], name, { type }));
-          const up = await fetch(`https://${server}.gofile.io/uploadFile`, { method: 'POST', body: form });
-          const j = await up.json();
-          const page = j?.data?.downloadPage || j?.data?.directLink;
-          if (!page) throw new Error(JSON.stringify(j).slice(0, 120));
-          return { ok: true, url: page, host: 'gofile', expires: '' };
-        }
-
-        async function try0x0() {
-          const form = new FormData();
-          form.append('file', blob, name);
-          const up = await fetch('https://0x0.st', { method: 'POST', body: form });
-          const text = (await up.text()).trim();
-          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || '0x0 rejected');
-          return { ok: true, url: text, host: '0x0', expires: '' };
-        }
-
-        async function tryTmpfiles() {
-          const form = new FormData();
-          form.append('file', blob, name);
-          const up = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: form });
-          const j = await up.json();
-          let u = j?.data?.url;
-          if (!u) throw new Error(JSON.stringify(j).slice(0, 120));
-          u = String(u).replace('http://', 'https://');
-          if (/tmpfiles\.org\/\d+\//.test(u)) u = u.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
-          return { ok: true, url: u, host: 'tmpfiles', expires: '~1 hour' };
-        }
-
-        async function tryFileIo() {
-          const form = new FormData();
-          form.append('file', blob, name);
-          const up = await fetch('https://file.io/?expires=7d', { method: 'POST', body: form });
-          const j = await up.json();
-          if (!j?.success || !j?.link) throw new Error(JSON.stringify(j).slice(0, 120));
-          return { ok: true, url: j.link, host: 'file.io', expires: j.expiry || '7 days' };
-        }
-
-        async function tryCatbox(litter) {
+        async function tryLitterbox() {
           const form = new FormData();
           form.append('reqtype', 'fileupload');
-          const file = new File([buf], name, { type });
+          form.append('time', '72h');
           form.append('fileToUpload', file);
-          let endpoint;
-          if (litter) {
-            form.append('time', '72h');
-            endpoint = 'https://litterbox.catbox.moe/resources/internals/api.php';
-          } else {
-            endpoint = 'https://catbox.moe/user/api.php';
-          }
-          const up = await fetch(endpoint, { method: 'POST', body: form });
+          const up = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+            method: 'POST',
+            body: form,
+          });
           const text = (await up.text()).trim();
-          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || 'catbox rejected');
+          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || `HTTP ${up.status}`);
+          return { ok: true, url: text, host: 'litterbox', expires: '72 hours' };
+        }
+
+        async function tryCatbox() {
+          const form = new FormData();
+          form.append('reqtype', 'fileupload');
+          form.append('fileToUpload', file);
+          const up = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: form });
+          const text = (await up.text()).trim();
+          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || `HTTP ${up.status}`);
+          return { ok: true, url: text, host: 'catbox', expires: '' };
+        }
+
+        // Direct file URL — plays in browser; Discord often embeds
+        async function tryPixeldrain() {
+          const form = new FormData();
+          form.append('file', file);
+          const up = await fetch('https://pixeldrain.com/api/file', { method: 'POST', body: form });
+          const j = await up.json().catch(() => ({}));
+          if (!up.ok || !j?.id) throw new Error(JSON.stringify(j).slice(0, 120) || `HTTP ${up.status}`);
+          // /api/file/ID is the raw file; /u/ID is a watch page
           return {
             ok: true,
-            url: text,
-            host: litter ? 'litterbox' : 'catbox',
-            expires: litter ? '72 hours' : '',
+            url: `https://pixeldrain.com/api/file/${j.id}`,
+            host: 'pixeldrain',
+            expires: '',
           };
         }
 
+        async function tryUguu() {
+          const form = new FormData();
+          form.append('files[]', file);
+          const up = await fetch('https://uguu.se/upload.php', { method: 'POST', body: form });
+          const j = await up.json().catch(() => ({}));
+          const u = j?.files?.[0]?.url || j?.url;
+          if (!u) throw new Error(JSON.stringify(j).slice(0, 120) || `HTTP ${up.status}`);
+          return { ok: true, url: String(u), host: 'uguu', expires: '~48 hours' };
+        }
+
         const chain = [];
-        // Direct media URLs only (play in browser + Discord embed). No download-only pages.
-        if (prefer === 'catbox') chain.push(['catbox', () => tryCatbox(false)]);
-        else if (prefer === 'litterbox') chain.push(['litterbox', () => tryCatbox(true)]);
-        else if (prefer === '0x0') chain.push(['0x0', try0x0]);
+        if (prefer === 'litterbox') chain.push(['litterbox', tryLitterbox]);
+        else if (prefer === 'catbox') chain.push(['catbox', tryCatbox]);
+        else if (prefer === 'pixeldrain') chain.push(['pixeldrain', tryPixeldrain]);
+        else if (prefer === 'uguu') chain.push(['uguu', tryUguu]);
         else {
-          const big = buf.byteLength > 200 * 1024 * 1024;
-          if (!big) chain.push(['catbox', () => tryCatbox(false)]);
+          // Order: what actually works from CF workers first
           chain.push(
-            ['litterbox', () => tryCatbox(true)],
-            ['0x0', try0x0],
+            ['litterbox', tryLitterbox],
+            ['pixeldrain', tryPixeldrain],
+            ['catbox', tryCatbox],
+            ['uguu', tryUguu],
           );
         }
 
@@ -110,14 +94,14 @@ export default {
           try {
             return json(await fn());
           } catch (e) {
-            errors.push(label + ': ' + String(e.message || e).slice(0, 80));
+            errors.push(label + ': ' + String(e.message || e).slice(0, 100));
           }
         }
-        return json({ error: errors.join(' | ') || 'all hosts failed' }, 502);
+        return json({ error: errors.join(' · ') || 'all hosts failed' }, 502);
       } catch (e) {
         return json({ error: String(e.message || e) }, 500);
       }
-  }
+    }
 
     if (url.pathname === '/ws') {
       const room = (url.searchParams.get('room') || 'lobby').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24) || 'lobby';
