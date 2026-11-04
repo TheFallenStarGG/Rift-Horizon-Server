@@ -262,6 +262,7 @@ export class GameRoom {
     this.wins = { A: 0, B: 0 };
     this.timer = null;
     this.bots = [];
+    this.vehOwners = Object.create(null); // vehicleId -> playerId
     this.botCfg = { teams: 2, size: 6, leaders: 1 };
   }
 
@@ -345,6 +346,11 @@ handleSession(ws, name, params) {
     });
     const leave = () => {
       if (!this.sessions.delete(id)) return;
+      if (s.vehId) {
+        delete this.vehOwners[s.vehId];
+        this.broadcast({ type: 'veh_exit', pid: s.id, id: s.vehId });
+        s.vehId = null;
+      }
       this.broadcast({ type: 'leave', id });
       if (!this.cfg.social) this.systemChat(`${name} left`);
       this.broadcastScores();
@@ -486,6 +492,9 @@ handleSession(ws, name, params) {
       }
       case 'bot_order': this.applyBotOrder(msg); break;
       case 'bot_hit': this.hitBot(msg, s); break;
+      case 'veh_claim': this.vehClaim(s, msg); break;
+      case 'veh': this.vehState(s, msg); break;
+      case 'veh_exit': this.vehExit(s, msg); break;
       case 'bot_team_wipe': this.wipeBotTeam(msg.team | 0); break;
       case 'bot_leader_spawn': this.spawnBotTeam(msg.team | 0, +msg.x || 0, +msg.z || 0); break;
       case 'respawn': break; // the server respawns players itself
@@ -556,8 +565,13 @@ handleSession(ws, name, params) {
   startRound() {
     this.round++;
     this.builds.clear();
+    this.vehOwners = Object.create(null);
     this.broadcast({ type: 'bclear' });
-    for (const s of this.sessions.values()) this.placePlayer(s, true, 0);
+    this.broadcast({ type: 'veh_reset' });
+    for (const s of this.sessions.values()) {
+      s.vehId = null;
+      this.placePlayer(s, true, 0);
+    }
     this.setPhase('countdown', 3);
   }
   toWaiting(note) {
@@ -889,6 +903,53 @@ handleSession(ws, name, params) {
       b.destX = b.order.x;
       b.destZ = b.order.z;
     }
+  }
+
+
+  vehClaim(s, msg) {
+    const id = String(msg.id ?? '');
+    if (!id) return;
+    const owner = this.vehOwners[id];
+    if (owner && owner !== s.id) {
+      this.send(s.ws, { type: 'veh_deny', id });
+      return;
+    }
+    if (s.vehId && s.vehId !== id) {
+      delete this.vehOwners[s.vehId];
+      this.broadcast({ type: 'veh_exit', pid: s.id, id: s.vehId });
+    }
+    this.vehOwners[id] = s.id;
+    s.vehId = id;
+    this.broadcast({ type: 'veh_claim', id, pid: s.id });
+  }
+  vehState(s, msg) {
+    const id = String(msg.id ?? s.vehId ?? '');
+    if (!id) return;
+    if (this.vehOwners[id] && this.vehOwners[id] !== s.id) return;
+    this.vehOwners[id] = s.id;
+    s.vehId = id;
+    this.broadcast({
+      type: 'veh',
+      pid: s.id,
+      id,
+      x: +msg.x || 0, y: +msg.y || 0, z: +msg.z || 0,
+      yaw: +msg.yaw || 0,
+      spd: +msg.spd || 0,
+      hp: +msg.hp || 0,
+      gas: +msg.gas || 0,
+    }, s.id);
+  }
+  vehExit(s, msg) {
+    const id = String(msg.id ?? s.vehId ?? '');
+    if (s.vehId && this.vehOwners[s.vehId] === s.id) delete this.vehOwners[s.vehId];
+    if (id && this.vehOwners[id] === s.id) delete this.vehOwners[id];
+    s.vehId = null;
+    this.broadcast({
+      type: 'veh_exit',
+      pid: s.id,
+      id,
+      x: +msg.x || 0, z: +msg.z || 0, yaw: +msg.yaw || 0,
+    }, s.id);
   }
 
   hitBot(msg, attacker) {
