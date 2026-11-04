@@ -19,85 +19,86 @@ export default {
         if (!/\.(mp4|webm)$/i.test(name)) name += '.webm';
         const buf = await request.arrayBuffer();
         if (!buf.byteLength) return json({ error: 'empty body' }, 400);
-        if (buf.byteLength > 1024 * 1024 * 1024) return json({ error: 'file too large (max 1GB)' }, 413);
-        const prefer = (url.searchParams.get('host') || 'auto').toLowerCase();
+        // Discord webhook limit is 25 MB for non-boosted servers
+        if (buf.byteLength > 24 * 1024 * 1024) {
+          return json({ error: 'file too large for Discord upload (max ~24 MB). Record a shorter clip.' }, 413);
+        }
         const type = request.headers.get('Content-Type') || (name.endsWith('.webm') ? 'video/webm' : 'video/mp4');
         const file = new File([buf], name, { type });
         const errors = [];
 
+        // --- Primary: Discord webhook (free, embeds in Discord, watchable CDN) ---
+        async function tryDiscord() {
+          const hook = env.DISCORD_WEBHOOK_URL || env.DISCORD_REC_WEBHOOK || '';
+          if (!hook || !/^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\//i.test(hook)) {
+            throw new Error('webhook not configured');
+          }
+          const form = new FormData();
+          form.append('file', file, name);
+          form.append('payload_json', JSON.stringify({
+            content: `🎬 **Realm Range clip** \`${name}\` (${(buf.byteLength / 1048576).toFixed(1)} MB)`,
+            allowed_mentions: { parse: [] },
+          }));
+          const up = await fetch(hook + (hook.includes('?') ? '&' : '?') + 'wait=true', {
+            method: 'POST',
+            body: form,
+          });
+          const j = await up.json().catch(() => ({}));
+          if (!up.ok) {
+            throw new Error((j?.message || JSON.stringify(j) || `HTTP ${up.status}`).slice(0, 140));
+          }
+          const att = j?.attachments?.[0];
+          const url = att?.url || att?.proxy_url;
+          if (!url) throw new Error('Discord returned no attachment URL');
+          return {
+            ok: true,
+            url,
+            host: 'discord',
+            expires: 'Discord CDN (stable for sharing)',
+          };
+        }
+
+        // Fallbacks — often blocked from CF IPs, but try anyway
         async function tryLitterbox() {
           const form = new FormData();
           form.append('reqtype', 'fileupload');
           form.append('time', '72h');
           form.append('fileToUpload', file);
-          const up = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
-            method: 'POST',
-            body: form,
-          });
+          const up = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', { method: 'POST', body: form });
           const text = (await up.text()).trim();
-          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || `HTTP ${up.status}`);
+          if (!/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 100) || `HTTP ${up.status}`);
           return { ok: true, url: text, host: 'litterbox', expires: '72 hours' };
         }
-
         async function tryCatbox() {
           const form = new FormData();
           form.append('reqtype', 'fileupload');
           form.append('fileToUpload', file);
           const up = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: form });
           const text = (await up.text()).trim();
-          if (!up.ok || !/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 120) || `HTTP ${up.status}`);
+          if (!/^https?:\/\//i.test(text)) throw new Error(text.slice(0, 100) || `HTTP ${up.status}`);
           return { ok: true, url: text, host: 'catbox', expires: '' };
         }
 
-        // Direct file URL — plays in browser; Discord often embeds
-        async function tryPixeldrain() {
-          const form = new FormData();
-          form.append('file', file);
-          const up = await fetch('https://pixeldrain.com/api/file', { method: 'POST', body: form });
-          const j = await up.json().catch(() => ({}));
-          if (!up.ok || !j?.id) throw new Error(JSON.stringify(j).slice(0, 120) || `HTTP ${up.status}`);
-          // /api/file/ID is the raw file; /u/ID is a watch page
-          return {
-            ok: true,
-            url: `https://pixeldrain.com/api/file/${j.id}`,
-            host: 'pixeldrain',
-            expires: '',
-          };
-        }
-
-        async function tryUguu() {
-          const form = new FormData();
-          form.append('files[]', file);
-          const up = await fetch('https://uguu.se/upload.php', { method: 'POST', body: form });
-          const j = await up.json().catch(() => ({}));
-          const u = j?.files?.[0]?.url || j?.url;
-          if (!u) throw new Error(JSON.stringify(j).slice(0, 120) || `HTTP ${up.status}`);
-          return { ok: true, url: String(u), host: 'uguu', expires: '~48 hours' };
-        }
-
+        const prefer = (url.searchParams.get('host') || 'auto').toLowerCase();
         const chain = [];
-        if (prefer === 'litterbox') chain.push(['litterbox', tryLitterbox]);
+        if (prefer === 'discord') chain.push(['discord', tryDiscord]);
+        else if (prefer === 'litterbox') chain.push(['litterbox', tryLitterbox]);
         else if (prefer === 'catbox') chain.push(['catbox', tryCatbox]);
-        else if (prefer === 'pixeldrain') chain.push(['pixeldrain', tryPixeldrain]);
-        else if (prefer === 'uguu') chain.push(['uguu', tryUguu]);
         else {
-          // Order: what actually works from CF workers first
-          chain.push(
-            ['litterbox', tryLitterbox],
-            ['pixeldrain', tryPixeldrain],
-            ['catbox', tryCatbox],
-            ['uguu', tryUguu],
-          );
+          chain.push(['discord', tryDiscord], ['litterbox', tryLitterbox], ['catbox', tryCatbox]);
         }
 
         for (const [label, fn] of chain) {
           try {
             return json(await fn());
           } catch (e) {
-            errors.push(label + ': ' + String(e.message || e).slice(0, 100));
+            errors.push(label + ': ' + String(e.message || e).slice(0, 120));
           }
         }
-        return json({ error: errors.join(' · ') || 'all hosts failed' }, 502);
+        const hint = errors.some((e) => e.includes('webhook not configured'))
+          ? ' Set DISCORD_WEBHOOK_URL on the worker (Discord channel → Integrations → Webhooks).'
+          : '';
+        return json({ error: (errors.join(' · ') || 'all hosts failed') + hint }, 502);
       } catch (e) {
         return json({ error: String(e.message || e) }, 500);
       }
