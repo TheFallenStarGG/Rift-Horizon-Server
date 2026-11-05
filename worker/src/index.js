@@ -368,6 +368,7 @@ handleSession(ws, name, params) {
     const sp = this.spawnFor(s);
     s.x = sp.x; s.y = sp.y; s.z = sp.z; s.yaw = sp.yaw; s.pitch = 0;
     s.hp = 100; s.alive = true; s.rl = false; s.respawnAt = 0;
+    s.lotUsed = false;
     s.protectUntil = Date.now() + protectMs;
     if (!notify) return;
     this.send(s.ws, { type: 'spawn', x: s.x, y: s.y, z: s.z, yaw: s.yaw, hp: 100, protect: protectMs });
@@ -394,9 +395,12 @@ handleSession(ws, name, params) {
         break;
       }
       case 'shoot': {
-        const gun = GUNS[msg.weapon];
-        if (!gun || !s.alive || !s.lo.includes(msg.weapon)) break;
-        if (now - s.lastShot < gun.cd * 550) break;
+      const gun = GUNS[msg.weapon];
+        // Ridgeback Lottery: one delete-round per life, fired through whatever gun the player is holding
+        const lot = msg.lottery === true && msg.weapon === 'ridgeback' && !s.lotUsed;
+        if (!gun || !s.alive || (!lot && !s.lo.includes(msg.weapon))) break;
+        if (!lot && now - s.lastShot < gun.cd * 550) break;
+        if (lot) s.lotUsed = true;
         s.lastShot = now;
         this.broadcast({
           type: 'shoot', id: s.id, weapon: msg.weapon,
