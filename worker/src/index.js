@@ -211,7 +211,10 @@ function cleanSpec(sp) {
   if (![ix, iz, lv, o, tier].every(Number.isFinite)) return null;
   if (Math.abs(ix) > 76 || Math.abs(iz) > 76 || lv < 0 || lv > 12 || tier < 0 || tier > 2) return null;
   if ((type === 'wall' && (o < 0 || o > 1)) || (type === 'floor' && o !== 0) || (type === 'ramp' && (o < 0 || o > 3))) return null;
-  return { type, ix, iz, lv, o, tier };
+  const spec = { type, ix, iz, lv, o, tier };
+  const e = Math.round(num(sp.e, 0)) & 511; // removed-tile mask (3x3), walls and floors only
+  if (e && e !== 511 && (type === 'wall' || type === 'floor')) spec.e = e;
+  return spec;
 }
 const specKey = (s) => `${s.type}:${s.ix}:${s.iz}:${s.lv}:${s.o}`;
 
@@ -446,7 +449,13 @@ handleSession(ws, name, params) {
         const spec = cleanSpec(msg.spec);
         if (!spec) break;
         const key = specKey(spec);
-        if (this.builds.has(key)) break;
+        const old = this.builds.get(key);
+        if (old) { // the same piece again = an edit of it (tiles removed / restored)
+          if (old.spec.tier !== spec.tier || (old.spec.e || 0) === (spec.e || 0)) break;
+          if (spec.e) old.spec.e = spec.e; else delete old.spec.e;
+          this.broadcast({ type: 'bplace', spec: old.spec }, s.id);
+          break;
+        }
         this.builds.set(key, { spec, hp: TIER_HP[spec.tier] });
         if (this.builds.size > MAX_PIECES) this.builds.delete(this.builds.keys().next().value);
         this.broadcast({ type: 'bplace', spec }, s.id);
