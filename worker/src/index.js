@@ -209,7 +209,7 @@ function cleanSpec(sp) {
   const ix = Math.round(num(sp.ix, NaN)), iz = Math.round(num(sp.iz, NaN)), lv = Math.round(num(sp.lv, NaN));
   const o = Math.round(num(sp.o, NaN)), tier = Math.round(num(sp.tier, NaN));
   if (![ix, iz, lv, o, tier].every(Number.isFinite)) return null;
-  if (Math.abs(ix) > 76 || Math.abs(iz) > 76 || lv < 0 || lv > 12 || tier < 0 || tier > 2) return null;
+  if (Math.abs(ix) > 1500 || Math.abs(iz) > 1500 || lv < 0 || lv > 12 || tier < 0 || tier > 2) return null;
   if ((type === 'wall' && (o < 0 || o > 1)) || (type === 'floor' && o !== 0) || (type === 'ramp' && (o < 0 || o > 3))) return null;
   const spec = { type, ix, iz, lv, o, tier };
   const e = Math.round(num(sp.e, 0)) & 511; // removed-tile mask (3x3), walls and floors only
