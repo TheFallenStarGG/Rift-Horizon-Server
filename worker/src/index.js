@@ -387,7 +387,7 @@ handleSession(ws, name, params) {
       case 'state': {
         if (!FROZEN.includes(this.phase) && s.alive) {
           s.x = clamp(num(msg.x, s.x), -BOUND, BOUND);
-          s.y = clamp(num(msg.y, s.y), 0, this.cfg.social ? 500 : 80);
+          s.y = clamp(num(msg.y, s.y), 0, this.cfg.social ? 500 : 1000);
           s.z = clamp(num(msg.z, s.z), -BOUND, BOUND);
           s.yaw = num(msg.yaw, s.yaw);
           s.pitch = clamp(num(msg.pitch, s.pitch), -1.5, 1.5);
