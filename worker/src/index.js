@@ -178,7 +178,7 @@ const DUEL = { A: { x: 194, y: 0, z: 170, yaw: -Math.PI / 2 }, B: { x: 246, y: 0
 // the shared lobby hall floats at y 400 (mirror LOBBY_SPAWN in lib/lobby.js)
 const LOBBY_SPAWN = { x: -240, y: 400, z: 256, yaw: 0 };
 
-const BOUND = 298;
+const BOUND = 5990;
 const TIER_HP = [140, 280, 420];
 const MAX_PIECES = 450;
 const FROZEN = ['countdown', 'intermission', 'ended'];
