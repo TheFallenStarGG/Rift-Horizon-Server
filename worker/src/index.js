@@ -2,7 +2,7 @@
  * Realm Range multiplayer — Cloudflare Worker + Durable Object rooms (class GameRoom, binding ROOM: unchanged).
  * Client: wss://<worker>/ws?room=CODE&name=Player&mode=ffa|duel|team|custom|lobby&lo=main.side.melee
  * The server owns health, damage, kills, rounds, respawns and builds.
- * KEEP the GUNS / MELEE tables in sync with lib/arsenal.js in the client repo.
+ * KEEP the GUNS / MELEE / ABIL tables in sync with lib/arsenal.js + lib/pack*.js in the client repo.
  */
 
 export default {
@@ -143,6 +143,18 @@ const GUNS = {
   spitfire: G(0.06, 18, 9, 7, { fall: [8, 20, 0.4] }),
   cutter: G(0.3, 20, 10, 7, { pellets: 10, fall: [4, 14, 0.1] }),
   whisper: G(0.9, 130, 75, 55),
+  // ABILITY: special primaries
+  hailstorm: G(0.085, 30, 15, 11, { fall: [25, 60, 0.6] }),
+  aegis: G(0.105, 38, 19, 13, { fall: [30, 65, 0.65] }),
+  spectre: G(0.36, 90, 45, 30),
+  sentinel: G(0.18, 56, 28, 19, { fall: [35, 80, 0.7] }),
+  gale: G(0.6, 17, 10, 6, { pellets: 7, fall: [5, 17, 0.15] }),
+  // ABILITY: special secondaries
+  cinder: G(0.35, 55, 28, 20, { fall: [20, 50, 0.6] }),
+  lifeline: G(0.16, 36, 18, 12, { fall: [20, 50, 0.55] }),
+  wisp: G(0.075, 22, 11, 8, { fall: [12, 28, 0.5] }),
+  snare: G(0.3, 60, 30, 22, { fall: [15, 40, 0.6] }),
+  beacon: G(0.22, 44, 22, 15, { fall: [20, 45, 0.6] }),
 };
 const MELEE = {
   fists: { front: 18, head: 28, range: 1.7, cd: 0.34 },
@@ -150,14 +162,44 @@ const MELEE = {
   machete: { front: 45, head: 65, range: 2.2, cd: 0.7, heal: 35 },
   tomahawk: { front: 40, head: 60, thrown: 120, range: 2.0, cd: 0.5, throwRange: 45, throwCd: 3.5 },
   sledge: { front: 80, head: 100, range: 2.5, cd: 1.1, demolish: true },
+  // ABILITY: special melee
+  katana: { front: 38, head: 55, range: 2.1, cd: 0.34 },
+  maul: { front: 70, head: 90, range: 2.4, cd: 1.0 },
+  hookblade: { front: 32, head: 48, range: 1.9, cd: 0.4 },
+  rapier: { front: 34, head: 50, range: 2.5, cd: 0.4 },
+  riftblade: { front: 48, head: 68, range: 2.2, cd: 0.62 },
 };
 const SLOT_OF = {
   vanguard: 'main', stinger: 'main', breacher: 'main', longbow: 'main', ridgeback: 'main',
+  hailstorm: 'main', aegis: 'main', spectre: 'main', sentinel: 'main', gale: 'main', // ABILITY
   p9: 'side', marshal: 'side', spitfire: 'side', cutter: 'side', whisper: 'side',
+  cinder: 'side', lifeline: 'side', wisp: 'side', snare: 'side', beacon: 'side', // ABILITY
   fists: 'melee', knife: 'melee', machete: 'melee', tomahawk: 'melee', sledge: 'melee',
+  katana: 'melee', maul: 'melee', hookblade: 'melee', rapier: 'melee', riftblade: 'melee', // ABILITY
 };
 const SLOTS = ['main', 'side', 'melee'];
 const DEFAULT_LO = ['vanguard', 'p9', 'knife'];
+
+// ABILITY: aim-button abilities of the special weapons (mirror lib/pack*.js). cd in seconds.
+// hit = damage the client may REPORT for that ability ('ahit'): max per hit, min gap per target, time window after use, max range.
+const ABIL = {
+  overdrive: { cd: 22 }, barrier: { cd: 20 }, phase: { cd: 26 }, scan: { cd: 28 }, mend: { cd: 30 },
+  firestorm: { cd: 25, hit: { max: 11, gap: 0.4, win: 7500 } },
+  dash: { cd: 7 }, mine: { cd: 12, hit: { max: 90, gap: 0.25 } }, recall: { cd: 14 }, blast: { cd: 10 },
+  grapple: { cd: 8 }, blink: { cd: 9, hit: { max: 75, gap: 0.5, win: 1200, range: 14 } },
+  slam: { cd: 12, hit: { max: 55, gap: 0.5, win: 1200, range: 8 } }, riposte: { cd: 12 },
+  wave: { cd: 9, hit: { max: 48, gap: 0.7, win: 2500, range: 45 } },
+};
+const ABIL_OF = {
+  hailstorm: 'overdrive', aegis: 'barrier', spectre: 'phase', sentinel: 'scan', gale: 'blast',
+  cinder: 'firestorm', lifeline: 'mend', wisp: 'dash', snare: 'mine', beacon: 'recall',
+  katana: 'blink', maul: 'slam', hookblade: 'grapple', rapier: 'riposte', riftblade: 'wave',
+};
+/** per-life ability state of a player */
+const newFx = () => ({
+  overUntil: 0, shield: 0, shieldUntil: 0, scanUntil: 0, mendUntil: 0, parryUntil: 0,
+  mines: [], mineBurst: 0, win: {}, weapon: {},
+});
 
 const MODES = {
   bots: { cap: 4, min: 1, teams: false, rounds: false, target: 999999, respawn: 3500, botArena: true },
@@ -304,6 +346,7 @@ handleSession(ws, name, params) {
       x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 100, alive: true,
       ads: false, crouch: false, sprint: false, rl: false, lo, weapon: lo[0],
       k: 0, d: 0, protectUntil: 0, respawnAt: 0, lastShot: 0, lastMelee: 0, lastThrow: 0, lastBd: 0, buildTimes: [],
+      fx: newFx(), cdUntil: {}, ahitAt: {}, // ABILITY
     };
     this.sessions.set(id, s);
     this.placePlayer(s, false, 0);
@@ -372,6 +415,7 @@ handleSession(ws, name, params) {
     s.x = sp.x; s.y = sp.y; s.z = sp.z; s.yaw = sp.yaw; s.pitch = 0;
     s.hp = 100; s.alive = true; s.rl = false; s.respawnAt = 0;
     s.lotUsed = false;
+    s.fx = newFx(); s.cdUntil = {}; s.ahitAt = {}; // ABILITY: fresh effects + cooldowns every life
     s.protectUntil = Date.now() + protectMs;
     if (!notify) return;
     this.send(s.ws, { type: 'spawn', x: s.x, y: s.y, z: s.z, yaw: s.yaw, hp: 100, protect: protectMs });
@@ -402,7 +446,8 @@ handleSession(ws, name, params) {
         // Ridgeback Lottery: one delete-round per life, fired through whatever gun the player is holding
         const lot = msg.lottery === true && msg.weapon === 'ridgeback' && !s.lotUsed;
         if (!gun || !s.alive || (!lot && !s.lo.includes(msg.weapon))) break;
-        if (!lot && now - s.lastShot < gun.cd * 550) break;
+        const over = s.fx.overUntil > now ? 0.6 : 1; // ABILITY: Overdrive fires faster
+        if (!lot && now - s.lastShot < gun.cd * over * 550) break;
         if (lot) s.lotUsed = true;
         s.lastShot = now;
         this.broadcast({
@@ -415,7 +460,9 @@ handleSession(ws, name, params) {
           if (!t || t === s) continue;
           const n = clamp(Math.round(num(h.n, 1)), 1, gun.pellets);
           const zone = h.zone === 'head' ? 'head' : h.zone === 'limb' ? 'limb' : 'body';
-          this.applyDamage(s, t, gun[zone] * falloff(gun.fall, dist3(s, t)) * n, { weapon: msg.weapon, head: zone === 'head' });
+          const d3 = dist3(s, t);
+          const mark = s.fx.scanUntil > now && d3 <= 70 ? 1.2 : 1; // ABILITY: Pulse Scan marks (+20%)
+          this.applyDamage(s, t, gun[zone] * falloff(gun.fall, d3) * n * mark, { weapon: msg.weapon, head: zone === 'head' });
         }
         break;
       }
@@ -436,6 +483,8 @@ handleSession(ws, name, params) {
         this.applyDamage(s, t, dmg, { weapon: msg.weapon, head: !thrown && msg.zone === 'head', heal: m.heal });
         break;
       }
+      case 'ability': this.onAbility(s, msg, now); break; // ABILITY
+      case 'ahit': this.onAbilityHit(s, msg, now); break; // ABILITY
       case 'loadout': {
         s.lo = parseLoadout(Array.isArray(msg.lo) ? msg.lo.join('.') : msg.lo);
         if (!s.lo.includes(s.weapon)) s.weapon = s.lo[0];
@@ -503,12 +552,98 @@ handleSession(ws, name, params) {
     }
   }
 
+  // ---------- abilities (ABILITY) ----------
+  /** The player used their weapon's aim-button ability. Cooldown + equipment are checked here. */
+  onAbility(s, msg, now) {
+    const ab = String(msg.ability || ''), A = ABIL[ab], weapon = String(msg.weapon || '');
+    if (!A || !s.alive || FROZEN.includes(this.phase)) return;
+    if (ABIL_OF[weapon] !== ab || !s.lo.includes(weapon)) return;
+    if (now < (s.cdUntil[ab] || 0)) return;
+    s.cdUntil[ab] = now + A.cd * 1000 * 0.85; // a little slack for latency
+    const fx = s.fx;
+    fx.weapon[ab] = weapon;
+    if (A.hit && A.hit.win) fx.win[ab] = now + A.hit.win;
+    switch (ab) {
+      case 'overdrive': fx.overUntil = now + 4800; break;
+      case 'barrier': fx.shield = 100; fx.shieldUntil = now + 6000; break;
+      case 'scan': fx.scanUntil = now + 6200; break;
+      case 'mend': fx.mendUntil = now + 3000; break;
+      case 'riposte': fx.parryUntil = now + 1000; break;
+      case 'dash': s.protectUntil = Math.max(s.protectUntil, now + 450); break;
+      case 'blink': s.protectUntil = Math.max(s.protectUntil, now + 350); break;
+      case 'recall': s.protectUntil = Math.max(s.protectUntil, now + 400); break;
+      case 'firestorm': fx.win[ab] = now + 7500; break;
+      case 'mine': fx.mines = fx.mines.filter((t) => t > now); fx.mines.push(now + 60000); if (fx.mines.length > 2) fx.mines.shift(); break;
+      default: break; // phase / blast / grapple: movement + wall-piercing are client side; the cooldown above is all we track
+    }
+  }
+
+  /** The client reports damage from an area ability (firestorm / mine / blink / slam / wave). Validated hard. */
+  onAbilityHit(s, msg, now) {
+    const ab = String(msg.ability || ''), A = ABIL[ab];
+    if (!A || !A.hit || !s.alive || this.phase !== 'live') return;
+    const t = this.sessions.get(msg.id);
+    if (!t || t === s) return;
+    const fx = s.fx;
+    if (A.hit.range && dist3(s, t) > A.hit.range) return;
+    if (ab === 'mine') { // one mine per burst; a burst can hit several players within 400ms
+      fx.mines = fx.mines.filter((x) => x > now);
+      if (now - fx.mineBurst > 400) {
+        if (!fx.mines.length) return;
+        fx.mines.shift();
+        fx.mineBurst = now;
+      }
+    } else if (now > (fx.win[ab] || 0)) return;
+    const key = ab + ':' + t.id;
+    if (now - (s.ahitAt[key] || 0) < A.hit.gap * 1000 * 0.8) return;
+    s.ahitAt[key] = now;
+    this.applyDamage(s, t, clamp(num(msg.dmg, 0), 1, A.hit.max), { weapon: fx.weapon[ab] || '', head: false });
+  }
+
+  /** shield + parry on incoming damage; returns what gets through */
+  fxAbsorb(tgt, dmg, now) {
+    const fx = tgt.fx;
+    if (!fx) return dmg;
+    if (fx.parryUntil > now) { // Riposte: negate the hit, counter the nearest enemy
+      fx.parryUntil = 0;
+      tgt.protectUntil = Math.max(tgt.protectUntil, now + 300);
+      this.counterStrike(tgt);
+      return 0;
+    }
+    if (fx.shield > 0 && fx.shieldUntil > now) { // Barrier
+      const a = Math.min(fx.shield, dmg);
+      fx.shield -= a;
+      dmg -= a;
+    }
+    return dmg;
+  }
+  counterStrike(p) {
+    let best = null, bd = 4.5;
+    for (const o of this.sessions.values()) {
+      if (o === p || !o.alive || (this.cfg.teams && o.team === p.team)) continue;
+      const d = dist3(p, o);
+      if (d < bd) { bd = d; best = o; }
+    }
+    if (best) this.applyDamage(p, best, 80, { weapon: 'rapier', head: false });
+  }
+  /** per-tick effects: Mend heals 15 HP/s for 3s */
+  tickFx(now) {
+    for (const s of this.sessions.values()) {
+      if (!s.alive || !s.fx || s.fx.mendUntil <= now || s.hp >= 100) continue;
+      s.hp = Math.min(100, s.hp + 3);
+      this.send(s.ws, { type: 'heal', hp: s.hp });
+      this.broadcast({ type: 'hp', id: s.id, hp: s.hp, alive: true });
+    }
+  }
+
   // ---------- combat ----------
   applyDamage(att, tgt, dmg, info) {
     if (this.phase !== 'live' || !tgt.alive || !att.alive || att === tgt) return;
     if (Date.now() < tgt.protectUntil) return;
     if (this.cfg.teams && att.team === tgt.team) return;
     dmg = Math.max(1, Math.round(dmg));
+    dmg = Math.round(this.fxAbsorb(tgt, dmg, Date.now())); // ABILITY: Barrier / Riposte
+    if (dmg <= 0) return;
     tgt.hp = Math.max(0, tgt.hp - dmg);
     this.send(tgt.ws, { type: 'damage', from: att.id, hp: tgt.hp, alive: tgt.hp > 0, dmg, weapon: info.weapon });
     this.broadcast({ type: 'hp', id: tgt.id, hp: tgt.hp, alive: tgt.hp > 0 });
@@ -517,6 +652,7 @@ handleSession(ws, name, params) {
 
   kill(att, tgt, info) {
     tgt.alive = false; tgt.hp = 0; tgt.d++; att.k++;
+    tgt.fx = newFx(); // ABILITY: effects end on death
     this.broadcast({ type: 'kill', killer: att.id, kname: att.name, victim: tgt.id, vname: tgt.name, weapon: info.weapon || '', head: !!info.head });
     if (info.heal) {
       att.hp = Math.min(100, att.hp + info.heal);
@@ -604,6 +740,7 @@ handleSession(ws, name, params) {
     const cfg = this.cfg;
     if (!cfg || cfg.social) return;
     const now = Date.now(), n = this.sessions.size;
+    this.tickFx(now); // ABILITY
     if (cfg.botArena) {
       this.tickBots();
       for (const s of this.sessions.values()) {
@@ -850,18 +987,22 @@ handleSession(ws, name, params) {
 
         const hitChance = Math.max(0.05, 0.28 - pd / 120 - (b.moving ? 0.08 : 0));
         if (Math.random() < hitChance) {
-          const dmg = 5 + Math.floor(Math.random() * 5);
-          player.hp = Math.max(0, player.hp - dmg);
-          this.send(player.ws, {
-            type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger',
-          });
-          if (player.hp <= 0) {
-            player.alive = false;
-            player.d++;
-            this.broadcast({
-              type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false,
+          let dmg = 5 + Math.floor(Math.random() * 5);
+          dmg = Math.round(this.fxAbsorb(player, dmg, now)); // ABILITY: Barrier / Riposte soak bot fire too
+          if (dmg > 0 && Date.now() >= player.protectUntil) {
+            player.hp = Math.max(0, player.hp - dmg);
+            this.send(player.ws, {
+              type: 'damage', from: b.id, hp: player.hp, alive: player.hp > 0, dmg, weapon: 'stinger',
             });
-            player.respawnAt = now + 3500;
+            if (player.hp <= 0) {
+              player.alive = false;
+              player.d++;
+              player.fx = newFx();
+              this.broadcast({
+                type: 'kill', killer: b.id, kname: b.name, victim: player.id, vname: player.name, head: false,
+              });
+              player.respawnAt = now + 3500;
+            }
           }
         }
       }
