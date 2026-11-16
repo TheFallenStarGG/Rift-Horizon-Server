@@ -1,14 +1,22 @@
 import baseWorker, { GameRoom } from './bot-lifecycle.js';
 import { installAccountHooks, handleApi, authToken } from './accounts.js';
+import { ClipStore, ClipIndex, handleClips } from './clips.js';
 
 installAccountHooks(GameRoom);
-export { GameRoom };
+export { GameRoom, ClipStore, ClipIndex };
 
 const API_PATH = /^\/api\/(auth\/|lb$|score$)/;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // recorder clips: /api/rec/* (upload) and /rec/<id>.mp4 (playback)
+    if (url.pathname.startsWith('/api/rec/') || url.pathname.startsWith('/rec/')) {
+      const r = await handleClips(request, env);
+      if (r) return r;
+    }
+
     if (API_PATH.test(url.pathname)) return handleApi(request, env, url);
 
     if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
