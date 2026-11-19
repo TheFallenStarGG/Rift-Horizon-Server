@@ -7,7 +7,19 @@ const enc = new TextEncoder();
 const SESSION_MS = 90 * 24 * 3600 * 1000;
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const RESERVED = new Set(['system', 'admin', 'server', 'moderator', 'player', 'guest']);
+/** Real owner account — exact match only; never renamed. */
+const OWNER_LC = 'thefallenstargg';
 const FLUSH_MS = 20000;
+
+/** Impersonation of TheFallenStarGG (any case / punctuation). Exact owner username is allowed. */
+export function isReservedUsername(name) {
+  const s = String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!s) return false;
+  if (s === OWNER_LC) return false;
+  if (s.includes('fallenstar') || s.includes('fallenstarg')) return true;
+  if (s.startsWith('thefallen')) return true;
+  return false;
+}
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -53,7 +65,34 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS stats (account_id INTEGER PRIMARY KEY, kills INTEGER NOT NULL DEFAULT 0, deaths INTEGER NOT NULL DEFAULT 0, headshots INTEGER NOT NULL DEFAULT 0, bot_kills INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, best_streak INTEGER NOT NULL DEFAULT 0, run_ms INTEGER, reflex INTEGER NOT NULL DEFAULT 0, dps INTEGER NOT NULL DEFAULT 0, secrets INTEGER NOT NULL DEFAULT 0, classified INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)`,
 ];
 let schemaReady = null;
-const ensureSchema = (env) => (schemaReady ||= sql(env, SCHEMA.map((s) => [s])).catch((e) => { schemaReady = null; throw e; }));
+
+/** One-shot: rename every impersonation account to invalidName / invalidName2 / … */
+async function scrubReservedNames(env) {
+  const [r] = await sql(env, [['SELECT id, username, username_lc FROM accounts', []]]);
+  const used = new Set((r.rows || []).map((row) => String(row.username_lc || '').toLowerCase()));
+  const stmts = [];
+  let n = 0;
+  for (const row of r.rows || []) {
+    if (!isReservedUsername(row.username) && !isReservedUsername(row.username_lc)) continue;
+    let next = 'invalidName';
+    let lc = next.toLowerCase();
+    while (used.has(lc)) {
+      n += 1;
+      next = 'invalidName' + n;
+      lc = next.toLowerCase();
+    }
+    used.delete(String(row.username_lc || '').toLowerCase());
+    used.add(lc);
+    stmts.push([`UPDATE accounts SET username = ?, username_lc = ? WHERE id = ?`, [next, lc, row.id]]);
+    console.log('[accounts] renamed reserved user', row.username, '->', next);
+  }
+  if (stmts.length) await sql(env, stmts);
+}
+
+const ensureSchema = (env) => (schemaReady ||= (async () => {
+  await sql(env, SCHEMA.map((s) => [s]));
+  await scrubReservedNames(env);
+})().catch((e) => { schemaReady = null; throw e; }));
 
 // ---------- crypto ----------
 const hex = (u8) => [...u8].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -163,7 +202,7 @@ export async function handleApi(request, env, url) {
       const lc = username.toLowerCase();
 
       if (path.endsWith('/signup')) {
-        if (RESERVED.has(lc)) return json({ error: 'username_taken' }, 409);
+        if (RESERVED.has(lc) || isReservedUsername(username)) return json({ error: 'username_taken' }, 409);
         const rec = await makePw(password, env);
         let id;
         try {
@@ -181,7 +220,21 @@ export async function handleApi(request, env, url) {
       const row = r.rows[0];
       const ok = await checkPw(password, row ? row.pw : DUMMY_PW);
       if (!row || !ok) return json({ error: 'bad_login' }, 401);
-      return json({ ok: true, token: await newSession(env, row.id), user: { username: row.username } });
+      let uname = row.username;
+      if (isReservedUsername(uname)) {
+        // Should already be scrubbed; if not, fix this row now
+        let next = 'invalidName', i = 0, nlc = next.toLowerCase();
+        for (;;) {
+          const [chk] = await sql(env, [[`SELECT id FROM accounts WHERE username_lc = ? AND id != ?`, [nlc, row.id]]]);
+          if (!chk.rows.length) break;
+          i += 1;
+          next = 'invalidName' + i;
+          nlc = next.toLowerCase();
+        }
+        await sql(env, [[`UPDATE accounts SET username = ?, username_lc = ? WHERE id = ?`, [next, nlc, row.id]]]);
+        uname = next;
+      }
+      return json({ ok: true, token: await newSession(env, row.id), user: { username: uname } });
     }
 
     if (path === '/api/auth/me' && request.method === 'GET') {
