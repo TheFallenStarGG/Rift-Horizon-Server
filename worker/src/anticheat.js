@@ -1,5 +1,5 @@
 /**
- * Rift Horizon anti-cheat
+ * Rift Horizon anti-cheat (Cloudflare Worker side).
  *
  *  1. SIGNATURE GATE   /api/ac/status + /api/ac/verify: the client hashes its own files, the worker compares them with
  *                      manifest.js and hands back a signed, short-lived "pass". entry.js refuses /ws joins without a valid
@@ -13,6 +13,7 @@
  *      AC_WEBHOOK_URL (optional, its own channel; falls back to DISCORD_WEBHOOK_URL / DISCORD_REC_WEBHOOK, the recordings webhook)
  *      AC_AUTOBAN_KICKS (optional number: ban the device after that many kicks in 24 h; uses the Turso database)
  * KEEP the W / MW tables in sync with lib/arsenal.js + lib/pack*.js and with GUNS / MELEE in index.js.
+ * KEEP the drop* numbers in sync with T (ALT, SPEED, FALL_*, CHUTE_*) in lib/dropship.js in the client repo.
  */
 import { BUILDS } from './manifest.js';
 
@@ -33,6 +34,18 @@ export const CFG = {
   slope: 1.15,                           // free climb per metre walked (ramps, stairs, hills)
   airCap: 8.5,                           // climb that is NOT explained by walking: jump + double jump + blast jump apex
   slack: 1.8, slackY: 0.8, maxDt: 3,
+  // ---- hot drop (lib/dropship.js: plane ALT 820 at SPEED 78, freefall <= 86 m/s down + 38 sideways, chute 16 sideways) ----
+  // The drop is 100% client side and the client never tells the worker, so the worker infers it: a player who joins an FFA / custom / bot
+  // room is "armed"; the first state up at plane altitude starts the drop; it ends when the player is low and no longer falling fast.
+  dropMinY: 700, dropMaxY: 900,          // plane altitude band that starts a drop (T.ALT = 820)
+  dropH: 100,                            // max horizontal m/s while dropping (plane 78 + walking in the cabin, freefall / chute are slower)
+  dropUp: 8,                             // max upward m/s while dropping (plane bob, the small hop out of the door)
+  dropDown: 110,                         // max downward m/s while dropping (dive 86)
+  dropLowY: 250,                         // below this the player is under (or near) canopy: look for the landing
+  dropLandVy: 3.5,                       // "not falling fast" = descending slower than this (canopy flare at the ground)
+  dropArmMs: 30000,                      // armed but never went up (?nodrop, slow client): stop waiting after this long
+  dropMaxMs: 600000, dropMaxLowMs: 60000, // hard limits so the drop state can never become a permanent exemption
+  dropLandGraceMs: 2500,                 // after landing: the last canopy velocity bleeds off, no speed check
   // ---- vehicles ----
   // Real vehicle ids are "v12" (cars, motorcycles; the client clamps them to 80 m/s) and "ac3" (lib/aircraft.js: plane / helicopter),
   // they never contain the type name, so caps are picked by id prefix first and by the vehCaps substring table second.
@@ -260,9 +273,11 @@ const newAc = (now) => ({
   wpn: '', wpnAt: 0, shotCredit: 1, shotAt: now, meleeCredit: 1, meleeAt: now, throwAt: 0, ammo: {}, rl: null,
   botTok: 12, botAt: now, vp: null, times: {}, alerts: {}, wouldAt: 0,
   vehUntil: 0, vehLast: '', graceUntil: 0, // driving tracking: last veh / veh_claim seen, its id, and the "skip the speed check" window
+  drop: 0, dropJoinAt: 0, dropAt: 0, dropLowAt: 0, dropStill: 0, // hot drop: 0 = none / over, 1 = armed (just joined), 2 = in the air
 });
 const acOf = (s) => s.ac || (s.ac = newAc(Date.now()));
-/** new life / spawn: movement baseline + full magazines (the client restocks on every respawn) */
+/** new life / spawn: movement baseline + full magazines (the client restocks on every respawn). Does NOT touch the hot-drop state:
+ *  the server also "spawns" everybody at round start while the client is still up in the plane. */
 function resetLife(ac, now) {
   ac.mvAt = now; ac.speed = 0; ac.bankH = CFG.slack; ac.bankV = CFG.slackY; ac.up = false; ac.hopUntil = ac.slideUntil = ac.boostUntil = ac.tpUntil = 0; ac.tp = 0;
   ac.air = ac.airCap = CFG.airCap; ac.ammo = {}; ac.rl = null; ac.shotCredit = 1; ac.shotAt = now; ac.vp = null; ac.overUntil = 0; ac.abReady = {};
@@ -346,6 +361,42 @@ function explainWithAbility(s, ac, now, hd, dy, dt, L) {
   return false;
 }
 
+/** re-sync the walking baseline after a legit teleport (drop start, landing, vehicle exit, spawn) */
+function rebase(ac) {
+  ac.bankH = CFG.slack; ac.bankV = CFG.slackY; ac.speed = 0; ac.up = false; ac.tp = 0; ac.air = ac.airCap; ac.vp = null;
+}
+
+/**
+ * Hot drop (lib/dropship.js). Returns the accepted { x, y, z } while the player is armed / dropping, or null when the normal checks should run.
+ *   armed (1): the first state up at plane altitude starts the drop (that jump from the spawn point to the plane is accepted).
+ *   active (2): loose caps that match the plane (78 m/s), freefall (<= 86 m/s down) and canopy; ends on landing.
+ */
+function dropStep(room, s, ac, now, dt, nx, ny, nz) {
+  if (!ac.drop) return null;
+  if (ac.drop === 1) {
+    if (ny >= CFG.dropMinY && ny <= CFG.dropMaxY) { ac.drop = 2; ac.dropAt = now; ac.dropLowAt = 0; ac.dropStill = 0; rebase(ac); return { x: nx, y: ny, z: nz }; }
+    if (now - ac.dropJoinAt > CFG.dropArmMs) ac.drop = 0; // never went up (?nodrop): stop waiting
+    return null;
+  }
+  const dtE = clamp(dt, 0.05, CFG.maxDt);
+  const dx = nx - s.x, dz = nz - s.z, dy = ny - s.y, hd = Math.hypot(dx, dz);
+  let ax = nx, ay = ny, az = nz, bad = '';
+  const allowH = CFG.dropH * dtE + CFG.slack;
+  if (hd > allowH) { bad = `drop speed ${(hd / dtE).toFixed(1)} m/s over ${hd.toFixed(1)} m (cap ${CFG.dropH})`; const k = allowH / hd; ax = s.x + dx * k; az = s.z + dz * k; }
+  const allowUp = CFG.dropUp * dtE + CFG.slackY, allowDown = CFG.dropDown * dtE + CFG.slackY;
+  if (dy > allowUp) { bad = bad || `drop rise ${(dy / dtE).toFixed(1)} m/s (cap ${CFG.dropUp})`; ay = s.y + allowUp; }
+  else if (-dy > allowDown) { bad = bad || `drop fall ${(-dy / dtE).toFixed(1)} m/s (cap ${CFG.dropDown})`; ay = s.y - allowDown; }
+  if (bad) flag(room, s, 'drop_move', 5, bad);
+  // landing: low, and no longer falling fast (the canopy flare at the ground), or just too long down here
+  if (ny < CFG.dropLowY) {
+    if (!ac.dropLowAt) ac.dropLowAt = now;
+    ac.dropStill = dy / dtE > -CFG.dropLandVy ? ac.dropStill + 1 : 0;
+    if (ac.dropStill >= 3 || now - ac.dropLowAt > CFG.dropMaxLowMs) { ac.drop = 0; ac.graceUntil = Math.max(ac.graceUntil, now + CFG.dropLandGraceMs); rebase(ac); }
+  } else { ac.dropLowAt = 0; ac.dropStill = 0; }
+  if (ac.drop && now - ac.dropAt > CFG.dropMaxMs) { ac.drop = 0; rebase(ac); }
+  return { x: ax, y: ay, z: az };
+}
+
 /** validates + clips a position update. returns the accepted { x, y, z } */
 function checkMove(room, s, msg, now) {
   const ac = s.ac, social = !!room.cfg.social;
@@ -354,12 +405,13 @@ function checkMove(room, s, msg, now) {
   const crouch = !!msg.crouch;
   const nx = clamp(num(msg.x, s.x), -BOUND, BOUND), nz = clamp(num(msg.z, s.z), -BOUND, BOUND), ny = clamp(num(msg.y, s.y), 0, social ? 500 : 1000);
 
-  // grace window (just entered / left a vehicle, just spawned): the position legitimately jumps and in-flight messages still carry the old
-  // one. Accept it (inside the world bounds) and re-sync the baseline instead of flagging a "speed" that is really a teleport.
-  if (now < ac.graceUntil) {
-    ac.bankH = CFG.slack; ac.bankV = CFG.slackY; ac.speed = 0; ac.up = false; ac.tp = 0; ac.air = ac.airCap;
-    return { x: nx, y: ny, z: nz };
-  }
+  // hot drop (plane / freefall / canopy): the client never reports it, so it is inferred here
+  const dropped = dropStep(room, s, ac, now, dt, nx, ny, nz);
+  if (dropped) return dropped;
+
+  // grace window (just entered / left a vehicle, just spawned, just landed): the position legitimately jumps and in-flight messages still carry
+  // the old one. Accept it (inside the world bounds) and re-sync the baseline instead of flagging a "speed" that is really a teleport.
+  if (now < ac.graceUntil) { rebase(ac); return { x: nx, y: ny, z: nz }; }
 
   let dx = nx - s.x, dz = nz - s.z, dy = ny - s.y, hd = Math.hypot(dx, dz), bad = '';
   if (now > ac.tpUntil) ac.tp = 0;
@@ -551,16 +603,22 @@ export function installAntiCheat(GameRoom) {
     let s = null;
     for (const x of this.sessions.values()) if (x.ws === ws) { s = x; break; }
     if (!s) return;
-    acOf(s).exempt = params.get('acx') === '1'; // entry.js sets this only for the verified owner account
+    const ac = acOf(s);
+    ac.exempt = params.get('acx') === '1'; // entry.js sets this only for the verified owner account
     s.did = String(params.get('did') || '').slice(0, 80);
+    // the client starts the hot drop (lib/dropship.js) on join in every mode without teams (FFA, custom, Bot Arena), never in the lobby
+    ac.drop = this.cfg && !this.cfg.social && !this.cfg.teams ? 1 : 0;
+    ac.dropJoinAt = Date.now();
   };
 
   const placePlayer = P.placePlayer;
   P.placePlayer = function (s, notify, ms) {
+    const wasDead = s.alive === false;
     placePlayer.call(this, s, notify, ms);
     const now = Date.now(), ac = acOf(s);
     resetLife(ac, now);
-    ac.graceUntil = now + CFG.spawnGraceMs; // the client still sends its old position for a few more ticks
+    ac.graceUntil = Math.max(ac.graceUntil, now + CFG.spawnGraceMs); // the client still sends its old position for a few more ticks
+    if (wasDead) ac.drop = 0; // a respawn after dying is a normal spawn, the client does not drop again
   };
 
   // ability messages (if the client sends them) also open the matching movement / overdrive window
