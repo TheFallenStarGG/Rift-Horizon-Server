@@ -1,5 +1,5 @@
 /**
- * Rift Horizon anti-cheat (Cloudflare Worker side).
+ * Rift Horizon anti-cheat
  *
  *  1. SIGNATURE GATE   /api/ac/status + /api/ac/verify: the client hashes its own files, the worker compares them with
  *                      manifest.js and hands back a signed, short-lived "pass". entry.js refuses /ws joins without a valid
@@ -33,8 +33,17 @@ export const CFG = {
   slope: 1.15,                           // free climb per metre walked (ramps, stairs, hills)
   airCap: 8.5,                           // climb that is NOT explained by walking: jump + double jump + blast jump apex
   slack: 1.8, slackY: 0.8, maxDt: 3,
+  // ---- vehicles ----
+  // Real vehicle ids are "v12" (cars, motorcycles; the client clamps them to 80 m/s) and "ac3" (lib/aircraft.js: plane / helicopter),
+  // they never contain the type name, so caps are picked by id prefix first and by the vehCaps substring table second.
+  vehCar: 85,                            // any ground vehicle (client hard-clamps to 80 m/s) + tolerance
+  vehAir: 170,                           // plane / helicopter (ids start with "ac")
   vehDefault: 150, vehMul: 1.35, vehSlack: 4,
-  vehCaps: { sedan: 42 },                // vehicle type (substring of the vehicle id) -> max speed m/s. Fill the rest from vehicles.js / aircraft.js
+  vehCaps: {},                           // optional: vehicle type (substring of the vehicle id) -> max speed m/s, multiplied by vehMul
+  vehSeenMs: 1500,                       // a veh / veh_claim message in the last 1.5 s means "this player is driving", even if vehId is not set
+  vehGraceMs: 1500,                      // after entering a vehicle: no speed check, baseline re-synced
+  exitGraceMs: 1500,                     // after leaving a vehicle (or the vehicle exploding): same
+  spawnGraceMs: 900,                     // after a server spawn / respawn: in-flight state messages still carry the old position
   // ---- combat ----
   shotMin: 0.8, shotBurst: 2.5,          // fire-rate token bucket (1 token = one cooldown)
   rlTol: 0.88, rlLead: 100,              // reload must last >= 88% of the real duration
@@ -250,12 +259,14 @@ const newAc = (now) => ({
   boostUntil: 0, boostH: 0, boostUp: 0, tp: 0, tpUntil: 0, air: CFG.airCap, airCap: CFG.airCap, abReady: {}, overUntil: 0,
   wpn: '', wpnAt: 0, shotCredit: 1, shotAt: now, meleeCredit: 1, meleeAt: now, throwAt: 0, ammo: {}, rl: null,
   botTok: 12, botAt: now, vp: null, times: {}, alerts: {}, wouldAt: 0,
+  vehUntil: 0, vehLast: '', graceUntil: 0, // driving tracking: last veh / veh_claim seen, its id, and the "skip the speed check" window
 });
 const acOf = (s) => s.ac || (s.ac = newAc(Date.now()));
 /** new life / spawn: movement baseline + full magazines (the client restocks on every respawn) */
 function resetLife(ac, now) {
   ac.mvAt = now; ac.speed = 0; ac.bankH = CFG.slack; ac.bankV = CFG.slackY; ac.up = false; ac.hopUntil = ac.slideUntil = ac.boostUntil = ac.tpUntil = 0; ac.tp = 0;
   ac.air = ac.airCap = CFG.airCap; ac.ammo = {}; ac.rl = null; ac.shotCredit = 1; ac.shotAt = now; ac.vp = null; ac.overUntil = 0; ac.abReady = {};
+  ac.vehUntil = 0; ac.vehLast = '';
 }
 
 function flag(room, s, check, w, detail) {
@@ -299,10 +310,12 @@ function every(ac, key, now, gapMs, count = 1, winMs = 0) {
 }
 
 // ================================================================== movement
+/** max speed (m/s) of a vehicle. Ids are "v12" (ground) or "ac3" (aircraft), so go by prefix, then by the optional type table. */
 function vehCap(id) {
-  const k = String(id).toLowerCase();
+  const k = String(id || '').toLowerCase();
+  if (k.startsWith('ac')) return CFG.vehAir;
   for (const [t, v] of Object.entries(CFG.vehCaps)) if (k.includes(t)) return v * CFG.vehMul + CFG.vehSlack;
-  return CFG.vehDefault;
+  return k ? CFG.vehCar : CFG.vehDefault;
 }
 function limits(ac, crouch, now, veh) {
   let h = CFG.walkCap, up = CFG.upCap;
@@ -340,21 +353,33 @@ function checkMove(room, s, msg, now) {
   ac.mvAt = now;
   const crouch = !!msg.crouch;
   const nx = clamp(num(msg.x, s.x), -BOUND, BOUND), nz = clamp(num(msg.z, s.z), -BOUND, BOUND), ny = clamp(num(msg.y, s.y), 0, social ? 500 : 1000);
+
+  // grace window (just entered / left a vehicle, just spawned): the position legitimately jumps and in-flight messages still carry the old
+  // one. Accept it (inside the world bounds) and re-sync the baseline instead of flagging a "speed" that is really a teleport.
+  if (now < ac.graceUntil) {
+    ac.bankH = CFG.slack; ac.bankV = CFG.slackY; ac.speed = 0; ac.up = false; ac.tp = 0; ac.air = ac.airCap;
+    return { x: nx, y: ny, z: nz };
+  }
+
   let dx = nx - s.x, dz = nz - s.z, dy = ny - s.y, hd = Math.hypot(dx, dz), bad = '';
   if (now > ac.tpUntil) ac.tp = 0;
-  const veh = s.vehId ? vehCap(s.vehId) : 0;
+  // "driving" = the server has a claim OR it has seen a vehicle update from this player very recently (a denied claim / an id clash
+  // can leave vehId unset while the client is really driving)
+  const vehId = s.vehId || (now < ac.vehUntil ? ac.vehLast : '');
+  const veh = vehId ? vehCap(vehId) : 0;
   let L = limits(ac, crouch, now, veh);
   if (!veh && (hd > Math.min(CFG.slack + L.h * 0.25, ac.bankH + L.h * dt) + ac.tp || dy > Math.min(CFG.slackY + L.up * 0.15, ac.bankV + L.up * dt) + ac.tp) && explainWithAbility(s, ac, now, hd, dy, dt, L)) L = limits(ac, crouch, now, veh);
 
   // allowance is a small bank (speed * elapsed time, capped) so network bunching is tolerated but the slack can't be farmed every update
   ac.bankH = Math.min(CFG.slack + L.h * 0.25, ac.bankH + L.h * dt);
   const allowH = ac.bankH + ac.tp;
-  if (hd > allowH) { bad = `speed ${(hd / dt).toFixed(1)} m/s (cap ${L.h})`; const k = allowH / hd; dx *= k; dz *= k; hd = allowH; }
+  // report speed over at least 50 ms: dt is clamped at 1 ms for bunched messages, which turned a 59 m gap into "59301 m/s"
+  if (hd > allowH) { bad = `speed ${(hd / Math.max(dt, 0.05)).toFixed(1)} m/s over ${hd.toFixed(1)} m (cap ${L.h})`; const k = allowH / hd; dx *= k; dz *= k; hd = allowH; }
   { const used = Math.min(hd, ac.bankH); ac.bankH -= used; ac.tp = Math.max(0, ac.tp - (hd - used)); }
 
   if (!veh) {
     ac.bankV = Math.min(CFG.slackY + L.up * 0.15, ac.bankV + L.up * dt);
-    if (dy > ac.bankV + ac.tp) { bad = bad || `rise ${(dy / dt).toFixed(1)} m/s (cap ${L.up})`; dy = ac.bankV + ac.tp; }
+    if (dy > ac.bankV + ac.tp) { bad = bad || `rise ${(dy / Math.max(dt, 0.05)).toFixed(1)} m/s (cap ${L.up})`; dy = ac.bankV + ac.tp; }
     if (dy > 0) ac.bankV = Math.max(0, ac.bankV - dy);
     if (ac.tp <= 0) {
       if (dy > 0) { // climbing that walking up a slope doesn't explain must come out of the jump budget (flight / super jump)
@@ -372,7 +397,7 @@ function checkMove(room, s, msg, now) {
   ac.crouch = crouch;
   if (dt >= 0.02) ac.speed = ac.speed * 0.6 + (hd / dt) * 0.4;
 
-  if (bad) flag(room, s, veh ? 'vehicle_move' : 'move', 5, bad);
+  if (bad) flag(room, s, veh ? 'vehicle_move' : 'move', 5, `${bad} | veh=${vehId || 'none'}`);
   return { x: s.x + dx, y: s.y + dy, z: s.z + dz };
 }
 
@@ -533,7 +558,9 @@ export function installAntiCheat(GameRoom) {
   const placePlayer = P.placePlayer;
   P.placePlayer = function (s, notify, ms) {
     placePlayer.call(this, s, notify, ms);
-    resetLife(acOf(s), Date.now());
+    const now = Date.now(), ac = acOf(s);
+    resetLife(ac, now);
+    ac.graceUntil = now + CFG.spawnGraceMs; // the client still sends its old position for a few more ticks
   };
 
   // ability messages (if the client sends them) also open the matching movement / overdrive window
@@ -589,13 +616,26 @@ export function installAntiCheat(GameRoom) {
     if (ok || !enforce) return onMessage.call(this, s, msg);
   };
 
-  // vehicles: speed + teleport checks on the owner's updates
+  // vehicles: speed + teleport checks on the owner's updates. Every claim / update also marks the player as "driving" for vehSeenMs,
+  // so the on-foot speed check in checkMove can never run on a player who is really in a car, plane or helicopter.
   const vehClaim = P.vehClaim, vehState = P.vehState, vehExit = P.vehExit;
-  P.vehClaim = function (s, msg) { acOf(s).vp = null; return vehClaim.call(this, s, msg); };
+  const markDriving = (ac, id, now, grace) => {
+    if (id) ac.vehLast = id;
+    const wasDriving = now < ac.vehUntil;
+    ac.vehUntil = now + CFG.vehSeenMs;
+    if (grace && !wasDriving) ac.graceUntil = Math.max(ac.graceUntil, now + CFG.vehGraceMs);
+  };
+  P.vehClaim = function (s, msg) {
+    const ac = acOf(s), now = Date.now();
+    ac.vp = null;
+    markDriving(ac, String((msg && msg.id) ?? ''), now, true);
+    return vehClaim.call(this, s, msg);
+  };
   P.vehState = function (s, msg) {
-    const ac = acOf(s);
+    const ac = acOf(s), now = Date.now();
+    markDriving(ac, String((msg && msg.id) ?? s.vehId ?? ''), now, true);
     if (ac.exempt || ac.kicked || acMode(this.env) === 'off') return vehState.call(this, s, msg);
-    const enforce = acMode(this.env) === 'enforce', now = Date.now(), id = String(msg.id ?? s.vehId ?? '');
+    const enforce = acMode(this.env) === 'enforce', id = String(msg.id ?? s.vehId ?? '');
     const x = num(msg.x), y = num(msg.y), z = num(msg.z), cap = vehCap(id);
     if (!ac.vp || ac.vp.id !== id) {
       if (Math.hypot(x - s.x, z - s.z) > 120 && ac.vp !== null) { flag(this, s, 'vehicle_teleport', 8, 'vehicle far from its driver'); if (enforce) return; }
@@ -604,7 +644,7 @@ export function installAntiCheat(GameRoom) {
       const dt = clamp((now - ac.vp.at) / 1000, 0.001, CFG.maxDt), dd = Math.hypot(x - ac.vp.x, y - ac.vp.y, z - ac.vp.z), allow = cap * dt + CFG.slack;
       let nx = x, ny = y, nz = z;
       if (dd > allow) {
-        flag(this, s, 'vehicle_move', 5, `vehicle ${(dd / dt).toFixed(0)} m/s (cap ${cap.toFixed(0)})`);
+        flag(this, s, 'vehicle_move', 5, `vehicle ${(dd / Math.max(dt, 0.05)).toFixed(0)} m/s over ${dd.toFixed(1)} m (cap ${cap.toFixed(0)}) | veh=${id}`);
         const k = allow / dd; nx = ac.vp.x + (x - ac.vp.x) * k; ny = ac.vp.y + (y - ac.vp.y) * k; nz = ac.vp.z + (z - ac.vp.z) * k;
         if (enforce) { msg.x = nx; msg.y = ny; msg.z = nz; }
       }
@@ -614,8 +654,10 @@ export function installAntiCheat(GameRoom) {
     return vehState.call(this, s, msg);
   };
   P.vehExit = function (s, msg) {
-    const ac = acOf(s);
-    ac.vp = null; ac.air = ac.airCap; ac.mvAt = Date.now();
+    const ac = acOf(s), now = Date.now();
+    ac.vp = null; ac.air = ac.airCap; ac.mvAt = now;
+    ac.vehUntil = 0; ac.vehLast = '';
+    ac.graceUntil = Math.max(ac.graceUntil, now + CFG.exitGraceMs); // the player is moved beside the vehicle (or the wreck) on exit
     if (!ac.exempt && acMode(this.env) === 'enforce' && Math.hypot(num(msg.x) - s.x, num(msg.z) - s.z) > 30) { msg.x = s.x; msg.z = s.z; } // no teleporting via the exit message
     return vehExit.call(this, s, msg);
   };
