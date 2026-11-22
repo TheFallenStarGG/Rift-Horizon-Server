@@ -1,7 +1,7 @@
 import baseWorker, { GameRoom } from './bot-lifecycle.js';
 import { installAccountHooks, handleApi, authToken, assertNotBanned } from './accounts.js';
 import { ClipStore, ClipIndex, handleClips } from './clips.js';
-import { installAntiCheat, handleAcApi, checkPass, gateMode } from './anticheat.js';
+import { installAntiCheat, handleAcApi, checkPass, gateMode, notifyJoin } from './anticheat.js';
 
 installAccountHooks(GameRoom);
 installAntiCheat(GameRoom); // last: its onMessage wrapper runs first
@@ -28,7 +28,7 @@ export default {
       if (r) return r;
     }
 
-    if (url.pathname.startsWith('/api/ac/')) return handleAcApi(request, env, url);
+    if (url.pathname.startsWith('/api/ac/')) return handleAcApi(request, env, url, ctx);
     if (API_PATH.test(url.pathname)) return handleApi(request, env, url);
 
     if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
@@ -72,6 +72,7 @@ export default {
         if (gate !== 'off') {
           const r = await checkPass(env, pass, did).catch(() => ({ ok: false, reason: 'error' }));
           if (!r.ok) {
+            notifyJoin(env, ctx, did || 'no device id', r.reason, gate === 'enforce');
             if (gate === 'enforce') return denied(r.reason);
             console.warn('[ac] join without a valid pass (warn mode):', r.reason, did);
           }
