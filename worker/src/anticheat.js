@@ -6,10 +6,12 @@
  *                      pass, so a modified client can't enter the lobby or any game.
  *  2. AUTHORITATIVE    installAntiCheat(GameRoom) wraps the room: movement speed / jump / flight, fire rate, magazines +
  *     CHECKS           reload times, pellet counts, hit geometry, bot hits, vehicles, building range, message flooding.
- *  3. ENFORCEMENT      every failed check adds violation points (they decay). Over KICK_VL -> kick, logged to Turso (ac_events),
- *                      optional auto-ban of the device after N kicks.
+ *  3. ENFORCEMENT      every failed check adds violation points (they decay). Over KICK_VL -> kick.
+ *  4. ALERTS           flags, kicks and signature problems are posted to a Discord webhook (rate limited + grouped), and logged to the worker log.
  *
- * Env: AC_SECRET (secret, signs passes) | AC_MODE = off | warn (default: log only) | enforce | AC_AUTOBAN_KICKS (optional number)
+ * Env: AC_SECRET (secret, signs passes) | AC_MODE = off | warn (default: log only) | enforce
+ *      AC_WEBHOOK_URL (optional, its own channel; falls back to DISCORD_WEBHOOK_URL / DISCORD_REC_WEBHOOK, the recordings webhook)
+ *      AC_AUTOBAN_KICKS (optional number: ban the device after that many kicks in 24 h; uses the Turso database)
  * KEEP the W / MW tables in sync with lib/arsenal.js + lib/pack*.js and with GUNS / MELEE in index.js.
  */
 import { BUILDS } from './manifest.js';
@@ -129,7 +131,7 @@ const limited = (ip, max = 40, win = 10 * 60 * 1000) => {
 };
 
 /** /api/ac/status (GET) and /api/ac/verify (POST) */
-export async function handleAcApi(request, env, url) {
+export async function handleAcApi(request, env, url, ctx) {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   const mode = gateMode(env);
   if (url.pathname === '/api/ac/status') return json({ mode, builds: Object.keys(BUILDS), files: mode === 'off' ? [] : allFiles() });
@@ -146,7 +148,13 @@ export async function handleAcApi(request, env, url) {
     const clean = {};
     for (const [k, v] of Object.entries(hashes).slice(0, 600)) if (typeof v === 'string' && /^([0-9a-f]{64}|missing)$/.test(v)) clean[k] = v;
     const r = compare(clean);
-    if (r.bad.length) console.warn('[ac] signature mismatch', did, r.build, r.bad.slice(0, 8).join(','));
+    if (r.bad.length) {
+      console.warn('[ac] signature mismatch', did, r.build, r.bad.slice(0, 8).join(','));
+      if (once('sig:' + did, 10 * 60 * 1000)) {
+        notify(env, ctx, { kind: 'signature', title: mode === 'enforce' ? '🧩 Modified files: join blocked' : '🧩 File signature mismatch (warn mode, allowed in)',
+          detail: r.bad.slice(0, 8).join('\n'), fields: [['Device', did], ['Closest build', r.build], ['Files differing', r.bad.length]] });
+      }
+    }
     if (r.bad.length && mode === 'enforce') return json({ ok: false, error: 'modified', bad: r.bad.slice(0, 8) }, 403);
     const exp = Date.now() + PASS_MS;
     return json({ ok: true, warn: r.bad.length > 0, token: await signPass(env, { b: r.build || 'warn', d: did, e: exp }), exp });
@@ -154,8 +162,51 @@ export async function handleAcApi(request, env, url) {
   return json({ error: 'not_found' }, 404);
 }
 
-// ================================================================== logging / bans (Turso, same DB as accounts.js)
-let acSchema = false;
+// ================================================================== alerts (Discord webhook)
+const hookUrl = (env) => {
+  const h = env.AC_WEBHOOK_URL || env.DISCORD_WEBHOOK_URL || env.DISCORD_REC_WEBHOOK || '';
+  return /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\//i.test(h) ? h : '';
+};
+const COLORS = { flag: 0xf1c40f, kick: 0xe74c3c, ban: 0x992d22, signature: 0x9b59b6, join: 0x95a5a6 };
+const hookState = { until: 0, n: 0, at: 0 };
+const clip = (v, n = 200) => String(v == null ? '' : v).slice(0, n) || '-';
+
+/** posts one embed to the webhook. Never throws. Soft cap 20 / minute (kicks and bans 40), and it backs off when Discord says 429. ctx: anything with waitUntil */
+export function notify(env, ctx, ev) {
+  const hook = hookUrl(env), now = Date.now();
+  if (!hook || now < hookState.until) return;
+  if (now - hookState.at > 60000) { hookState.at = now; hookState.n = 0; }
+  if (hookState.n >= (ev.kind === 'kick' || ev.kind === 'ban' ? 40 : 20)) return;
+  hookState.n++;
+  const fields = (ev.fields || []).filter(([, v]) => v !== undefined && v !== '').slice(0, 10).map(([name, value]) => ({ name, value: clip(value), inline: true }));
+  const body = {
+    username: 'Anti-Cheat', allowed_mentions: { parse: [] },
+    embeds: [{ title: clip(ev.title, 250), description: ev.detail ? clip(ev.detail, 800) : undefined, color: COLORS[ev.kind] || COLORS.flag, fields, timestamp: new Date(now).toISOString() }],
+  };
+  const p = fetch(hook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(async (r) => { if (r.status === 429) { let s = 5; try { s = Number((await r.json()).retry_after) || 5; } catch (_) { /* default */ } hookState.until = Date.now() + s * 1000; } })
+    .catch((e) => console.error('[ac] webhook failed', e && e.message));
+  try { ctx.waitUntil(p); } catch (_) { /* no ctx: the fetch still runs */ }
+}
+
+/** "once per window per key" for the join / signature alerts (a player retrying must not spam the channel) */
+const seen = new Map();
+function once(key, ms) {
+  const now = Date.now();
+  if ((seen.get(key) || 0) > now) return false;
+  if (seen.size > 500) for (const [k, v] of seen) if (v < now) seen.delete(k);
+  seen.set(key, now + ms);
+  return true;
+}
+/** entry.js: someone joined without a valid pass (warn mode lets them in, enforce mode refused them) */
+export function notifyJoin(env, ctx, did, reason, blocked) {
+  if (!once('join:' + did, 30 * 60 * 1000)) return;
+  notify(env, ctx, { kind: 'join', title: blocked ? '🚫 Join refused: no valid pass' : 'Joined without a valid pass (warn mode)', fields: [['Device', did], ['Reason', reason]] });
+}
+
+const playerFields = (room, s) => [['Player', s.name], ['Account', s.aid ? 'logged in' : 'guest'], ['Device', s.did], ['Mode', room.mode], ['Violation', Math.round(s.ac.vl)]];
+
+// optional auto-ban: only used when AC_AUTOBAN_KICKS is set. It needs the Turso database (same one accounts.js uses) to count kicks.
 async function tsql(env, stmts) {
   const base = String(env.TURSO_DATABASE_URL || '').trim().replace(/^libsql:\/\//, 'https://').replace(/\/+$/, '');
   if (!base || !env.TURSO_AUTH_TOKEN) return null;
@@ -173,31 +224,23 @@ async function tsql(env, stmts) {
     return r.response.result.rows;
   });
 }
-async function record(env, ev) {
-  if (!acSchema) {
-    const ok = await tsql(env, [
-      [`CREATE TABLE IF NOT EXISTS ac_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, check_name TEXT, device TEXT, name TEXT, room TEXT, detail TEXT)`],
-      [`CREATE TABLE IF NOT EXISTS bans (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, value TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, UNIQUE(kind, value))`],
-    ]);
-    if (!ok) return; // no database configured
-    acSchema = true;
-  }
+async function autoBan(room, s) {
+  const n = parseInt(room.env.AC_AUTOBAN_KICKS, 10) || 0;
+  if (n <= 0 || !s.did) return;
   const now = Date.now();
-  await tsql(env, [[`INSERT INTO ac_events (at, kind, check_name, device, name, room, detail) VALUES (?,?,?,?,?,?,?)`,
-    [now, ev.kind, ev.check, ev.device || null, ev.name || null, ev.room || null, String(ev.detail || '').slice(0, 300)]]]);
-  const n = parseInt(env.AC_AUTOBAN_KICKS, 10) || 0;
-  if (ev.kind !== 'kick' || n <= 0 || !ev.device) return;
-  const [r] = await tsql(env, [[`SELECT COUNT(*) FROM ac_events WHERE kind = 'kick' AND device = ? AND at > ?`, [ev.device, now - 24 * 3600 * 1000]]]);
+  const ok = await tsql(room.env, [
+    [`CREATE TABLE IF NOT EXISTS ac_kicks (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, device TEXT NOT NULL)`],
+    [`CREATE TABLE IF NOT EXISTS bans (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, value TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, UNIQUE(kind, value))`],
+    [`INSERT INTO ac_kicks (at, device) VALUES (?, ?)`, [now, s.did]],
+  ]);
+  if (!ok) return;
+  const [r] = await tsql(room.env, [[`SELECT COUNT(*) FROM ac_kicks WHERE device = ? AND at > ?`, [s.did, now - 24 * 3600 * 1000]]]);
   if (Number(r[0][0].value) < n) return;
   const ban = (kind, value) => [`INSERT INTO bans (kind, value, reason, created_at) VALUES (?,?,?,?) ON CONFLICT(kind, value) DO UPDATE SET reason = excluded.reason, created_at = excluded.created_at`, [kind, value, 'anticheat', now]];
-  const stmts = [ban('device', ev.device)];
-  if (ev.account) stmts.push(ban('username', String(ev.account).toLowerCase()));
-  await tsql(env, stmts);
-  console.warn('[ac] auto-banned', ev.device, ev.account || '');
-}
-function persist(room, s, kind, check, detail) {
-  const p = record(room.env, { kind, check, detail, device: s.did, name: s.name, room: room.mode, account: s.aid ? s.name : '' }).catch((e) => console.error('[ac] log failed', e && e.message));
-  try { room.state.waitUntil(p); } catch (_) { /* not in a DO */ }
+  const stmts = [ban('device', s.did)];
+  if (s.aid && s.name) stmts.push(ban('username', String(s.name).toLowerCase()));
+  await tsql(room.env, stmts);
+  notify(room.env, room.state, { kind: 'ban', title: '⛔ Auto-banned', detail: `${n} anti-cheat kicks in 24 hours`, fields: playerFields(room, s) });
 }
 
 // ================================================================== per-player state
@@ -206,7 +249,7 @@ const newAc = (now) => ({
   mvAt: now, bankH: CFG.slack, bankV: CFG.slackY, speed: 0, crouch: false, up: false, upY: 0, peakY: 0, hopUntil: 0, slideUntil: 0, slideCap: 0,
   boostUntil: 0, boostH: 0, boostUp: 0, tp: 0, tpUntil: 0, air: CFG.airCap, airCap: CFG.airCap, abReady: {}, overUntil: 0,
   wpn: '', wpnAt: 0, shotCredit: 1, shotAt: now, meleeCredit: 1, meleeAt: now, throwAt: 0, ammo: {}, rl: null,
-  botTok: 12, botAt: now, vp: null, times: {},
+  botTok: 12, botAt: now, vp: null, times: {}, alerts: {}, wouldAt: 0,
 });
 const acOf = (s) => s.ac || (s.ac = newAc(Date.now()));
 /** new life / spawn: movement baseline + full magazines (the client restocks on every respawn) */
@@ -220,8 +263,21 @@ function flag(room, s, check, w, detail) {
   ac.vl = Math.max(0, ac.vl - ((now - ac.vlAt) / 1000) * CFG.decay) + w;
   ac.vlAt = now; ac.flagged++;
   console.warn('[ac]', JSON.stringify({ room: room.mode, name: s.name, did: s.did, check, vl: Math.round(ac.vl), detail: detail || '' }));
-  if (ac.flagged === 1 || ac.flagged % 25 === 0) persist(room, s, 'flag', check, detail);
-  if (ac.vl >= CFG.kickVl && String(room.env.AC_MODE || '').toLowerCase() === 'enforce') kick(room, s, check, detail);
+  // one alert per player + check per minute, with a count of what was held back
+  const al = ac.alerts[check] || (ac.alerts[check] = { at: 0, n: 0 });
+  al.n++;
+  if (now - al.at >= 60000) {
+    const more = al.n - 1;
+    al.at = now; al.n = 0;
+    notify(room.env, room.state, { kind: 'flag', title: '⚠️ ' + check, detail: (detail || '') + (more ? ` (+${more} more since the last alert)` : ''), fields: playerFields(room, s) });
+  }
+  if (ac.vl >= CFG.kickVl) {
+    if (String(room.env.AC_MODE || '').toLowerCase() === 'enforce') kick(room, s, check, detail);
+    else if (now - ac.wouldAt > 120000) { // warn mode: tell the owner what enforce mode would have done
+      ac.wouldAt = now;
+      notify(room.env, room.state, { kind: 'kick', title: '🔨 Would be kicked (warn mode): ' + check, detail, fields: playerFields(room, s) });
+    }
+  }
 }
 function kick(room, s, check, detail) {
   const ac = s.ac;
@@ -229,7 +285,9 @@ function kick(room, s, check, detail) {
   ac.kicked = true;
   room.send(s.ws, { type: 'kicked', reason: 'anticheat' });
   try { s.ws.close(4001, 'anticheat'); } catch (_) { /* already closed */ }
-  persist(room, s, 'kick', check, detail);
+  notify(room.env, room.state, { kind: 'kick', title: '🔨 Kicked: ' + check, detail, fields: playerFields(room, s) });
+  const p = autoBan(room, s).catch((e) => console.error('[ac] auto-ban failed', e && e.message));
+  try { room.state.waitUntil(p); } catch (_) { /* not in a DO */ }
 }
 /** simple per-type rate limiter. true = allowed */
 function every(ac, key, now, gapMs, count = 1, winMs = 0) {
